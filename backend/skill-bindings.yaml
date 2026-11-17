@@ -1,0 +1,58 @@
+# 项目侧「技能 → 类别」绑定表
+#
+# 为什么需要这张表：通用 Agent Skills 规范只强制 name + description，
+# metadata.applies-to 是本项目的私有字段。你从 GitHub 拿来的技能不写它是常态，
+# 而加载器又不能靠关键词猜「这个技能属于哪个阶段」——猜错就会一次装进半个库。
+# 所以把「技能属于哪一类」这件事放在项目侧声明，技能文件本身一个字不用改。
+#
+# 生效优先级：技能自带 metadata.applies-to > 本表 > agents/openai.yaml。
+# 没在这张表里出现的技能一律视为 manual：只在用户显式勾选时装载。
+#
+# 可用类别：characters props scenes storyboard blocking script review media global
+#   characters 角色   props 道具   scenes 场景   storyboard 分镜   blocking 站位
+#   script 剧本/大纲/原著   review 审查   media 生图出片配音剪辑   global 每次必装
+#
+# 注意：值必须是非空列表，写 `[]` 或留空会被忽略。
+# 改完保存即生效（加载器按文件 mtime 缓存，不用重启服务）。
+
+# ---- 当前两段调用实际在用的绑定 ----
+
+# 第一段「盘资产」：视觉设定拆解（角色 / 角色道具 / 场景）
+short-drama-assets: [characters, props, scenes]
+
+# 第二段「站位 + 15s 分镜」：分镜组表与场面调度
+# 必须启用：站位格式、组时长、单镜下限这些硬规则都在这个技能里，
+# 不装的话第二段只能靠内置提示词，机检违规率会明显变高。
+short-drama-storyboard: [storyboard, blocking]
+
+# ---- 后续阶段预留：需要时去掉行首 # 即可启用 ----
+# 下面这些技能按 AGENTS.md 的 S3–S8 规划，各自只在对应阶段才有意义，
+# 现在绑上去会让每次调用白白多烧十几 k token，所以默认关闭。
+
+# 图片提示词（S3 / S6）：把资产描述改写成可直接复制的生图提示词。
+# 与 assets 叠加会显著推高第一段的 token（两份技能的 references 都要内联），
+# 当前 prompt 字段由 assets 技能的口径覆盖，等真正接生图时再开。
+# short-drama-image-prompts: [characters, props, scenes]
+
+# 视频提示词（S6）：分镜转可复制的视频提示词
+# short-drama-video-prompts: [media]
+
+# 提交出片（S7）：批量跑图跑视频
+# short-drama-produce: [media]
+
+# 剪辑成片（S8）
+# short-drama-edit: [media]
+
+# 机检门禁 / 审表（S5）：审查各阶段产出
+# short-drama-review: [review, storyboard]
+
+# 上游产物：原著拆解、改编方案、剧本
+# short-drama-novel-analyze: [script]
+# short-drama-develop: [script]
+# short-drama-write: [script]
+# short-drama-breakdown: [script, review]
+
+# 项目台（跨阶段编排）：体量最大，不建议 global 常驻，按需手动勾选
+# short-drama: [global]
+
+# 旧版 5 个素材型技能已不在目录中，绑定表留着也不会报错（找不到就忽略）。

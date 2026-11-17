@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# vue-tsc 曾把 .ts/.vue 编译到 src/ 同目录生成 .js，
+# 会与 .ts 抢 Vite 的模块解析优先级；现在 tsconfig 已设 noEmit，这里兜底。
+src/**/*.js
