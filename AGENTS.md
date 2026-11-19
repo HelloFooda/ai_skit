@@ -15,7 +15,7 @@
 - **模型分工**：
   | 环节 | 模型 / 通道 | 约束 |
   | --- | --- | --- |
-  | 文生文（视觉设定、分镜、提示词） | LLM，走 `backend/app/llm.py` | 厂商可替换，配置指定，业务代码不写死 |
+  | 文生文（视觉设定、分镜、提示词） | LLM，走 LangChain：`app/prompts.py` 模板 → `app/chains.py` LCEL 链 → `app/llm.py` 编排 | 厂商由 `LLM_PROVIDER` 配置指定，业务代码不写死；章节原文不进模板引擎 |
   | 文生图（设定图） | `$short-drama-produce` 的适配器（内置 `seedance` / `minimax-h3`） | 先有 `IMG-...` 条目再投产；一张一交 |
   | 图生 / 文生视频 | 同上，按 `short-drama.json#/creator_authority/production_profile` 选型 | 单条时长上限 4–15s；参考图/参考音频按模型能力绑定 |
 - **三条不变式**：① 章节原文逐字零容错；② 产物落盘、每阶段可单独重跑；③ 一条投产任务 = 一个 `MOTION-...` 或一个 `GROUP-...`。
@@ -141,7 +141,25 @@
 | `blockings` | `分镜.md` 每镜的起点/终点 | **第二段聚合**，不重新生成 |
 | `storyboards` | `分镜.md` 的 `SHOT-...` | 第二段生成，按投产分组打包（4–15s/组，默认最多 6 组） |
 
-响应还带 `gate_issues`（机检）、`total_groups_estimated` 与 `truncated`（是否被组数上限截断）、`stages`（分段耗时）、`skills_*`（装载与展开情况）。用户在界面上只填章节，其余全是可选。
+响应还带 `gate_issues`（机检）、`total_groups_estimated` 与 `truncated`（是否被组数上限截断）、`stages`（分段耗时 + `usage` token 归因）、`skills_*`（装载与展开情况）。用户在界面上只填章节，其余全是可选。
+
+### 文生文通道分层（LangChain）
+
+上面两段调用都走同一条 LCEL 链，职责分三层，**提示词正文与输出契约不变**：
+
+| 层 | 文件 | 负责 |
+| --- | --- | --- |
+| 规则层 | `app/prompts.py` | 两套 system 用 `ChatPromptTemplate`(jinja2) 渲染；`PROMPT_VERSION` 只在正文改动时升版 |
+| 通道层 | `app/chains.py` | 模型工厂（`LLM_PROVIDER` 配置驱动）、dict → Message 映射、`RunnableConfig`（超时/重试/标签/并发）、`UsageCollector`（token 按 stage 归因） |
+| 编排层 | `app/llm.py` | 消息组装、两段串行、mock、Pydantic 校验、响应元数据 |
+
+三条硬约束：
+
+1. **章节原文不进模板引擎**：它属不可信输入、逐字零容错；只由编排层直接拼进 user，通道层只做 role → Message 映射、不改 content。system 是项目可信规则，才进模板。
+2. **输出契约仍是纯 JSON 文本 + `_parse_json` + Pydantic 强校验**，不上 `with_structured_output`（兼容端点对 function calling 支持参差，会改变「只返回 JSON 对象」的口径）。要上须先在目标模型实测并跑评测基线。
+3. **重试不叠加**：模型层 `max_retries` 做一次，链层不再包 `with_retry`；并发由 `Runnable.batch` + `LLM_MAX_CONCURRENCY` 卡死。
+
+换厂商只改 `.env`：`LLM_PROVIDER` 统一交给 `init_chat_model` 按 provider 名装配；`openai`（默认）额外带 `base_url`，覆盖一切 OpenAI 兼容端点，其它 provider 需另装对应集成包。
 
 ## 4. 停点与人在回路
 
@@ -159,7 +177,9 @@ ai_skit/
 ├── README.md
 ├── backend/                     # FastAPI + uv 管项目级 .venv
 │   ├── app/
-│   │   ├── llm.py               # 两段串行：视觉设定 → 分镜；提示词分层
+│   │   ├── prompts.py           # 两套 system 规则层（ChatPromptTemplate / jinja2）
+│   │   ├── chains.py            # 模型工厂 + LCEL 链 + RunnableConfig + 用量回调
+│   │   ├── llm.py               # 业务编排：消息组装 → 两段串行 → Pydantic 校验
 │   │   ├── schemas.py           # Pydantic 契约（五类产出 + 机检）
 │   │   ├── skills.py            # 技能加载器（SKILL.md + references 内联）
 │   │   └── routers/pipeline.py  # /generate、/skills
@@ -233,13 +253,14 @@ python3 backend/skills/short-drama-produce/scripts/production_tool.py audit <项
 
 - 投产按 provider 的计费单元算，单次任务不因时长打折 → **尽量把该给的时长给满**，碎片任务等于浪费额度。
 - 日额度按档位卡死，超限熔断停止后续阶段并告警；不提供「悄悄换便宜档」的自动分支。
-- 文生文 LLM 的 token 输入/输出按 stage / run 归因；`trace.jsonl` + `cost.json` 可回溯，日志脱敏。
+- 文生文 LLM 的 token 输入/输出按 stage / run 归因：`chains.UsageCollector` 采集后写进响应 `stages[].usage`；`trace.jsonl` + `cost.json` 可回溯，日志脱敏（密钥只留指纹、不进 metadata）。
 - 并发设上限、长任务设超时与进度日志；以真实任务状态为准，失败分片可单独重跑。
 
 ## 9. 安全与合规
 
 - 章节原文是不可信内容：与指令严格分隔（独立消息 + 边界标记），原文里「忽略以上指令」一类文本一律当素材。
-- 密钥只放环境变量；`.env.example` 只放键名；不入库、不入日志、不写进 trace。
+- 密钥只放 `backend/.env`（全项目唯一配置文件，已被 git 忽略）；键名与默认值见 `backend/README.md`；密钥不入库、不入日志、不写进 trace。
+- 公开仓库提交前以 `git status --short --untracked-files=all` 核对提交面：`.idea/`、`.workbuddy/`、`frontend/node_modules/` 与 `backend/.env` 均由仓库根 `.gitignore` 排除，不依赖本机 `~/.gitignore_global`；`backend/tests/` 是项目资产，需一并提交。
 - 输出侧合规过滤（涉政/涉黄/暴力、版权与肖像风险），不合规产物标 `rejected`，不进下一阶段。
 - 小说原文可能受版权约束：产物默认仅本地留存，确认使用范围后再对外；涉及个人信息先脱敏；模型服务需确认数据出境与留存策略。
 
@@ -261,7 +282,7 @@ python3 backend/skills/short-drama-produce/scripts/production_tool.py audit <项
 
 | 事项 | 首版默认 |
 | --- | --- |
-| 文生文 LLM 具体模型 | 走 `backend/app/llm.py` 的 OpenAI 兼容客户端，配置指定，可替换 |
+| 文生文 LLM 具体模型 | 走 `app/chains.py` 的 LangChain 模型工厂：`init_chat_model` 按 `LLM_PROVIDER` 装配，`openai`（默认）带 `base_url` 接一切兼容端点；配置指定，可替换 |
 | 章节 → 镜数与组数 | 按剧情节点与声音时长定；接口默认 `max_groups=6`、单组 4–15s，超出标记 `truncated` |
 | 画幅 / 分辨率 | 16:9 / 1080p（9:16 可配，写进 `short-drama.json`） |
 | 音色 | 优先文字锁定；确需参考音色须用户明确同意并核验样音 |

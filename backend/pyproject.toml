@@ -6,7 +6,16 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    "openai>=1.40",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    # 文生文通道：LangChain 1.x（模型抽象 / 提示词模板 / LCEL 链 / 回调可观测）
+    "langchain>=1.0,<2",
+    "langchain-openai>=1.0,<2",
+    "jinja2>=3.1",
+]
+
+[dependency-groups]
+# 本地门禁工具也由 uv 锁定版本，`uv sync` 一次装齐；不再靠 uvx 临时拉取。
+dev = [
+    "ruff>=0.17,<1",
 ]
