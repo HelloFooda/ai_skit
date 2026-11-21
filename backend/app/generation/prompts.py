@@ -1,10 +1,9 @@
-"""文生文的提示词层：LangChain `ChatPromptTemplate`（jinja2）渲染两套 system 规则。
+"""文生文的提示词层：`jinja2.Template` 渲染两套 system 规则。
 
 ## 为什么只模板化 system，不模板化 user
 
-`ChatPromptTemplate` 把「规则层」与「变量」分开，配合 `PROMPT_VERSION`
-可以版本化、A/B、回归。但本项目有一条更硬的红线：**章节原文逐字零容错，
-且属不可信输入**。所以：
+模板把「规则层」与「变量」分开，配合 `PROMPT_VERSION` 可以版本化、A/B、回归。
+但本项目有一条更硬的红线：**章节原文逐字零容错，且属不可信输入**。所以：
 
 - system（可信的项目规则 / 技能规范 / 输出契约）→ 走 jinja2 模板渲染；
 - user（章节原文、资产表、补充要求）→ **不进模板引擎**，由 `llm.py`
@@ -17,9 +16,8 @@ jinja2 只认 `{{ }}` / `{% %}` / `{# #}`；两套模板里的 JSON 输出契约
 
 ## 逐字等价（迁移不升版本号）
 
-模板字符串刻意不保留结尾换行：`jinja2.Template` 默认
-`keep_trailing_newline=False`，会吃掉结尾那一个 `\\n`。渲染函数统一补回，
-保证迁移前后 system 提示词**逐字相同**（回归测试见
+模板以 `keep_trailing_newline=True` 构造、并在末尾显式补一个 `\\n`，
+保证渲染结果与迁移前的字符串拼接**逐字相同**（回归测试见
 `tests/unit/test_langchain_chain.py::PromptEquivalenceTests`）。
 内容没变、只换了载体，所以 `PROMPT_VERSION` 仍是 v7，不需要重跑基线评测。
 """
@@ -28,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from langchain_core.prompts import ChatPromptTemplate
+from jinja2 import Template
 
 # 类别 key -> (中文名, 该类别单独调用时的输出契约)
 CATEGORIES: dict[str, tuple[str, str]] = {
@@ -157,21 +155,20 @@ _VISUAL_SYSTEM_TEMPLATE = """你是短剧分镜师。唯一任务：基于**已�
   ]
 }"""
 
-# jinja2 会吃掉模板末尾的换行；渲染函数统一补回，见模块 docstring。
+# jinja2 默认吃掉模板末尾的换行；这里显式保留（模板尾部补的那个 \n 就是最终提示词的结尾）。
 _TRAILING_NL = "\n"
 
-_ASSET_TEMPLATE = ChatPromptTemplate.from_messages(
-    [("system", _ASSET_SYSTEM_TEMPLATE)], template_format="jinja2"
-)
-_VISUAL_TEMPLATE = ChatPromptTemplate.from_messages(
-    [("system", _VISUAL_SYSTEM_TEMPLATE)], template_format="jinja2"
-)
+_ASSET_TEMPLATE = Template(_ASSET_SYSTEM_TEMPLATE + _TRAILING_NL, keep_trailing_newline=True)
+_VISUAL_TEMPLATE = Template(_VISUAL_SYSTEM_TEMPLATE + _TRAILING_NL, keep_trailing_newline=True)
 
 
-def _render(template: ChatPromptTemplate, **kwargs: object) -> str:
-    """渲染单条 system 消息的文本；补回 jinja2 吃掉的结尾换行。"""
-    messages = template.format_messages(**kwargs)
-    return str(messages[0].content) + _TRAILING_NL
+def _render(template: Template, **kwargs: object) -> str:
+    """渲染单条 system 文本。
+
+    只产出一个字符串，不需要 `ChatPromptTemplate` 的消息装配与 Message 包装——
+    要的是「规则层可模板化、可版本化」，不是多角色消息编排。
+    """
+    return template.render(**kwargs)
 
 
 def render_asset_system(only: str | None, skill_text: str = "") -> str:

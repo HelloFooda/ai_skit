@@ -11,11 +11,11 @@
 ## 1. 项目概述与模型分工
 
 - **定位**：把「小说章节文本」自动转成一条 **15 秒量级 AI 短视频**的 Agent 项目；主干沿用技能包的五份文档链路（剧本 → 视觉设定 → 图片提示词 → 分镜 → 视频提示词）。
-- **首版范围**：一个章节 → 一集（EP001）→ 若干个 4–15 秒的合生分组；剧情装不下按剧情节点拆组，**不硬塞、不删台词**。不做多章节连续剧、不做长视频。
+- **首版范围**：一个章节 → 一集（EP001）→ 若干个 4–15 秒的合生分组；剧情装不下按剧情节点拆组，**不硬塞、不删台词**。多章输入支持逐章独立生成（各出一集），但不做跨章资产自动复用的连续剧、不做长视频。
 - **模型分工**：
   | 环节 | 模型 / 通道 | 约束 |
   | --- | --- | --- |
-  | 文生文（视觉设定、分镜、提示词） | LLM，走 LangChain：`app/prompts.py` 模板 → `app/chains.py` LCEL 链 → `app/llm.py` 编排 | 厂商由 `LLM_PROVIDER` 配置指定，业务代码不写死；章节原文不进模板引擎 |
+  | 文生文（视觉设定、分镜、提示词） | LLM，走 LangChain：`app/generation/graph.py` 多章图 → `app/generation/chapters.py` 切章 → `app/generation/agent.py` 章内 agent（模型自选工具 + 顺序闸门）→ `app/generation/llm.py` 单章两段 → `app/generation/chains.py` LCEL 链（`app/generation/prompts.py` 出 system） | 厂商由 `LLM_PROVIDER` 配置指定，业务代码不写死；章节原文不进模板引擎；多章顺序由图边固定，章内顺序由中间件守 |
   | 文生图（设定图） | `$short-drama-produce` 的适配器（内置 `seedance` / `minimax-h3`） | 先有 `IMG-...` 条目再投产；一张一交 |
   | 图生 / 文生视频 | 同上，按 `short-drama.json#/creator_authority/production_profile` 选型 | 单条时长上限 4–15s；参考图/参考音频按模型能力绑定 |
 - **三条不变式**：① 章节原文逐字零容错；② 产物落盘、每阶段可单独重跑；③ 一条投产任务 = 一个 `MOTION-...` 或一个 `GROUP-...`。
@@ -141,7 +141,7 @@
 | `blockings` | `分镜.md` 每镜的起点/终点 | **第二段聚合**，不重新生成 |
 | `storyboards` | `分镜.md` 的 `SHOT-...` | 第二段生成，按投产分组打包（4–15s/组，默认最多 6 组） |
 
-响应还带 `gate_issues`（机检）、`total_groups_estimated` 与 `truncated`（是否被组数上限截断）、`stages`（分段耗时 + `usage` token 归因）、`skills_*`（装载与展开情况）。用户在界面上只填章节，其余全是可选。
+响应还带 `gate_issues`（机检）、`total_groups_estimated` 与 `truncated`（是否被组数上限截断）、`stages`（分段耗时 + `usage` token 归因）、`skills_*`（装载与展开情况）。单章路径 `/generate` 只填 `chapter`；多章主路径 `/generate-novel` 填 `novel_title` 与 `content` 两个字段，其余全是可选。
 
 ### 文生文通道分层（LangChain）
 
@@ -149,9 +149,10 @@
 
 | 层 | 文件 | 负责 |
 | --- | --- | --- |
-| 规则层 | `app/prompts.py` | 两套 system 用 `ChatPromptTemplate`(jinja2) 渲染；`PROMPT_VERSION` 只在正文改动时升版 |
-| 通道层 | `app/chains.py` | 模型工厂（`LLM_PROVIDER` 配置驱动）、dict → Message 映射、`RunnableConfig`（超时/重试/标签/并发）、`UsageCollector`（token 按 stage 归因） |
-| 编排层 | `app/llm.py` | 消息组装、两段串行、mock、Pydantic 校验、响应元数据 |
+| 规则层 | `app/generation/prompts.py` | 两套 system 用 `jinja2.Template` 渲染；`PROMPT_VERSION` 只在正文改动时升版 |
+| 通道层 | `app/generation/chains.py` | 模型工厂（`LLM_PROVIDER` 配置驱动、`lru_cache` 复用）、dict → Message 映射、`RunnableConfig`（超时/重试/标签/并发）、`UsageCollector`（token 按 stage 归因） |
+| 编排层 | `app/generation/llm.py` | 消息组装、两段串行、mock、Pydantic 校验、响应元数据 |
+| 章内 agent | `app/generation/agent.py` | `create_agent` + `plan_assets` / `write_storyboard` 两个工具 + `wrap_tool_call` 顺序闸门 |
 
 三条硬约束：
 
@@ -160,6 +161,17 @@
 3. **重试不叠加**：模型层 `max_retries` 做一次，链层不再包 `with_retry`；并发由 `Runnable.batch` + `LLM_MAX_CONCURRENCY` 卡死。
 
 换厂商只改 `.env`：`LLM_PROVIDER` 统一交给 `init_chat_model` 按 provider 名装配；`openai`（默认）额外带 `base_url`，覆盖一切 OpenAI 兼容端点，其它 provider 需另装对应集成包。
+
+### 多章编排（LangGraph 外层 + create_agent 章内）
+
+主路径是**三层编排**，不是各函数自己写前置检查：
+
+- `app/generation/chapters.py`：行首正则认「第X章/回/节/部/篇/集」与「序章/序幕/楔子/引子/终章/尾声/后记/番外」，标题行允许 `📖 `/`## ` 等装饰前缀；只对源串切片，`"".join(raw) == source` 逐字回拼；同一实现注册为 `@tool split_chapters`。上限 20 章、每章 20,000 字。
+- `app/generation/graph.py`（外层）：图边固定 `START → split → generate →(未走完则回环)→ finalize → END`。回环条件 `chapter_index < len(chapters)` 是代码判定，不是模型判断。
+- `app/generation/agent.py`（章内）：`generate` 节点调一次 `create_agent`，模型自选 `plan_assets` / `write_storyboard`；`wrap_tool_call` 闸门守硬依赖——资产表未落地就拒绝分镜调用。这是「模型决定路径，代码守依赖」。章节原文经 state 传给工具（工具 schema 为空，模型无法复述改写）；任何一章没有工具产出即抛错，不返半成品。
+- 成本口径：`llm_calls`（生成）与 `agent_calls`（编排决策）分开报，相加才是总调用数。auto 一章真实调用约 2 次生成 + 3 次编排。
+- 后续文生图 / 生视频阶段在**外层图加节点 + 加边**，不要在每个函数入口重复写「必须先有 XX」的自约束。这是选 StateGraph 的唯一理由：顺序集中在一处表达。
+- `/generate` 单章路径保留兼容，走原来的固定两段链，不进 agent。
 
 ## 4. 停点与人在回路
 
@@ -176,13 +188,13 @@ ai_skit/
 ├── AGENTS.md  AGENT.md -> AGENTS.md
 ├── README.md
 ├── backend/                     # FastAPI + uv 管项目级 .venv
-│   ├── app/
-│   │   ├── prompts.py           # 两套 system 规则层（ChatPromptTemplate / jinja2）
-│   │   ├── chains.py            # 模型工厂 + LCEL 链 + RunnableConfig + 用量回调
-│   │   ├── llm.py               # 业务编排：消息组装 → 两段串行 → Pydantic 校验
-│   │   ├── schemas.py           # Pydantic 契约（五类产出 + 机检）
-│   │   ├── skills.py            # 技能加载器（SKILL.md + references 内联）
-│   │   └── routers/pipeline.py  # /generate、/skills
+│   ├── app/                     # 按职责分五个子包，根目录只留入口
+│   │   ├── main.py              # FastAPI 入口 + 日志初始化 + 中间件挂载
+│   │   ├── api/                 # HTTP 接口层：/generate-novel、/generate、/skills；errors.py 收口异常→状态码
+│   │   ├── core/                # 核心层：config.py（配置）+ schemas.py（数据契约）
+│   │   ├── generation/          # 生成层：prompts → chains → llm → agent → graph + chapters.py + mock_data.py
+│   │   ├── observability/       # 可观测层：logging.py（日志回调）+ usage.py（token 提取）+ middleware.py（请求中间件）
+│   │   └── knowledge/           # 知识层：skills.py（SKILL.md + references 加载）
 │   ├── skills/                  # ★ 技能包（12 个 short-drama-*，不改内容）
 │   ├── skill-bindings.yaml      # 项目侧「技能 → 类别」绑定表
 │   └── tests/                   # ★ 所有测试统一放这里，按类型分子目录
@@ -259,7 +271,7 @@ python3 backend/skills/short-drama-produce/scripts/production_tool.py audit <项
 ## 9. 安全与合规
 
 - 章节原文是不可信内容：与指令严格分隔（独立消息 + 边界标记），原文里「忽略以上指令」一类文本一律当素材。
-- 密钥只放 `backend/.env`（全项目唯一配置文件，已被 git 忽略）；键名与默认值见 `backend/README.md`；密钥不入库、不入日志、不写进 trace。
+- 密钥只放 `backend/.env`（全项目唯一配置文件，已被 git 忽略）；键名与默认值见 `docs/backend.md#配置backendenv全项目唯一一份`；密钥不入库、不入日志、不写进 trace。
 - 公开仓库提交前以 `git status --short --untracked-files=all` 核对提交面：`.idea/`、`.workbuddy/`、`frontend/node_modules/` 与 `backend/.env` 均由仓库根 `.gitignore` 排除，不依赖本机 `~/.gitignore_global`；`backend/tests/` 是项目资产，需一并提交。
 - 输出侧合规过滤（涉政/涉黄/暴力、版权与肖像风险），不合规产物标 `rejected`，不进下一阶段。
 - 小说原文可能受版权约束：产物默认仅本地留存，确认使用范围后再对外；涉及个人信息先脱敏；模型服务需确认数据出境与留存策略。
@@ -282,7 +294,7 @@ python3 backend/skills/short-drama-produce/scripts/production_tool.py audit <项
 
 | 事项 | 首版默认 |
 | --- | --- |
-| 文生文 LLM 具体模型 | 走 `app/chains.py` 的 LangChain 模型工厂：`init_chat_model` 按 `LLM_PROVIDER` 装配，`openai`（默认）带 `base_url` 接一切兼容端点；配置指定，可替换 |
+| 文生文 LLM 具体模型 | 走 `app/generation/chains.py` 的 LangChain 模型工厂：`init_chat_model` 按 `LLM_PROVIDER` 装配，`openai`（默认）带 `base_url` 接一切兼容端点；配置指定，可替换 |
 | 章节 → 镜数与组数 | 按剧情节点与声音时长定；接口默认 `max_groups=6`、单组 4–15s，超出标记 `truncated` |
 | 画幅 / 分辨率 | 16:9 / 1080p（9:16 可配，写进 `short-drama.json`） |
 | 音色 | 优先文字锁定；确需参考音色须用户明确同意并核验样音 |

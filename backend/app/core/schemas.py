@@ -325,3 +325,87 @@ class SkillCatalogResponse(BaseModel):
     errors: list[str] = Field(
         default_factory=list, description="格式不合法、已跳过的技能文件（不影响服务）"
     )
+
+
+# ---------------------------------------------------------------- 小说名 + 多章输入（LangGraph 编排）
+
+class NovelPipelineRequest(BaseModel):
+    """两字段输入：小说名独立；章节标题与正文同框，由行的「第X章」边界确定性切分。"""
+
+    novel_title: str = Field(min_length=1, max_length=200, description="小说名，逐字保留供资产归档")
+    content: str = Field(
+        min_length=10,
+        max_length=200_000,
+        description="若干章的「标题行 + 正文」，标题独占一行、从「第X章」开头",
+    )
+
+    character_hint: str = Field(default="", max_length=2_000, description="角色类补充要求")
+    prop_hint: str = Field(default="", max_length=2_000, description="道具类补充要求")
+    scene_hint: str = Field(default="", max_length=2_000, description="场景类补充要求")
+
+    # visual_only 依赖外部已定稿资产表，多章逐章生成时语义不成立，这里不放开
+    mode: Literal["auto", "assets_only", "per_type"] = Field(
+        default="auto", description="auto 出全五类；assets_only 只出资产；per_type 三类并发"
+    )
+
+    target_duration: float = Field(default=15.0, ge=4, le=15, description="单组目标时长（秒）")
+    max_groups: int = Field(default=6, ge=1, le=20, description="每章最多产出几组")
+    skills: list[str] = Field(default_factory=list, max_length=20, description="点名装载的技能")
+    scene_filter: list[str] = Field(default_factory=list, max_length=20, description="只拆这些场景")
+
+
+class ChapterOutput(BaseModel):
+    """一章的产出：五类内容 + 该章独立的成本/机检元数据。"""
+
+    index: int
+    title: str
+    text_chars: int
+    characters: list[Character] = Field(default_factory=list)
+    props: list[Prop] = Field(default_factory=list)
+    scenes: list[Scene] = Field(default_factory=list)
+    blockings: list[Blocking] = Field(default_factory=list)
+    storyboards: list[StoryboardGroup] = Field(default_factory=list)
+    latency_ms: int
+    prompt_version: str
+    mode: str
+    llm_calls: int
+    # agent 编排自己发起的模型调用次数（选工具 / 收尾），与 llm_calls（生成）分开计，
+    # 两者相加才是这一章的真实模型调用成本
+    agent_calls: int = 0
+    hints_used: list[str] = Field(default_factory=list)
+    injection_warning: bool = False
+    skills_loaded: list[str] = Field(default_factory=list)
+    skills_skipped: list[str] = Field(default_factory=list)
+    skills_refs_expanded: int = 0
+    skills_refs_skipped: int = 0
+    stages: list[dict] = Field(default_factory=list)
+    gate_issues: list[GateIssue] = Field(default_factory=list)
+    total_groups_estimated: int = 0
+    truncated: bool = False
+
+
+class NovelPipelineResponse(BaseModel):
+    run_id: str
+    model: str
+    mock: bool
+    novel_title: str
+    chapter_count: int
+    chapters: list[ChapterOutput] = Field(default_factory=list)
+    total_llm_calls: int = 0
+    total_agent_calls: int = 0
+    total_latency_ms: int = 0
+    total_characters: int = 0
+    total_props: int = 0
+    total_scenes: int = 0
+    total_storyboards: int = 0
+    injection_warning: bool = False
+    gate_issue_count: int = 0
+
+
+def chapter_output(item: dict) -> ChapterOutput:
+    """把图中的章结果（package 是对象）压成响应契约（五类摊平）。
+
+    `model_validate` 会忽略多余键（package），所以直接合并、交给 Pydantic 校验一次，
+    不必逐字段手搬——少一处改字段忘记同步的地方。
+    """
+    return ChapterOutput.model_validate({**item, **item["package"].model_dump()})

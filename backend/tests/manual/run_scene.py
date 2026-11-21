@@ -11,8 +11,8 @@ from pathlib import Path
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.llm import extract_assets
-from app.schemas import Assets
+from app.core.schemas import Assets
+from app.generation.llm import extract_assets
 
 ROOT = BACKEND_ROOT.parent
 CHAPTER = (ROOT / "剧集" / "EP001" / "输入" / "第1章.txt").read_text(encoding="utf-8")

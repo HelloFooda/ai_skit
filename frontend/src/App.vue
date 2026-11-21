@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import {
-  generatePackage,
+  generateNovel,
   listSkills,
-  type ExtractMode,
-  type GenerateResponse,
+  type NovelExtractMode,
+  type NovelGenerateResponse,
   type SkillInfo,
 } from "./api";
 
-const chapter = ref(
-  "林桂芳推开老饭馆的木门，铜钥匙在掌心攥得发烫。傍晚的暖黄顶灯下，沈砚舟正低头擦着一只旧怀表。",
+const novelTitle = ref("测试小说");
+const content = ref(
+  "第一章：雨夜来客\n林桂芳推开老饭馆的木门，铜钥匙在掌心攥得发烫。傍晚的暖黄顶灯下，沈砚舟正低头擦着一只旧怀表。\n\n" +
+    "第二章：铜钥匙\n沈砚舟抬起头：「你怎么来了。」林桂芳摊开手掌，铜钥匙在灯下发亮。",
 );
 
 // 高级设置：默认全部走默认口径，用户不用管
@@ -17,7 +19,7 @@ const showAdvanced = ref(false);
 const characterHint = ref("");
 const propHint = ref("");
 const sceneHint = ref("");
-const mode = ref<ExtractMode>("auto");
+const mode = ref<NovelExtractMode>("auto");
 const targetDuration = ref(15);
 const maxGroups = ref(6);
 
@@ -29,7 +31,9 @@ const skillNotice = ref("");
 
 const loading = ref(false);
 const error = ref("");
-const result = ref<GenerateResponse | null>(null);
+const novelResult = ref<NovelGenerateResponse | null>(null);
+const activeChapter = ref(0);
+const current = computed(() => novelResult.value?.chapters[activeChapter.value] ?? null);
 
 const CATEGORY_LABELS: Record<string, string> = {
   characters: "角色",
@@ -55,7 +59,7 @@ const autoLoadable = computed(() =>
 
 /** 分镜总时长（按组时长之和，用来核对是否超出一章容量） */
 const totalSeconds = computed(() =>
-  (result.value?.storyboards ?? []).reduce((sum, g) => sum + g.duration, 0),
+  (current.value?.storyboards ?? []).reduce((sum, g) => sum + g.duration, 0),
 );
 
 onMounted(async () => {
@@ -77,10 +81,12 @@ onMounted(async () => {
 async function run() {
   loading.value = true;
   error.value = "";
-  result.value = null;
+  novelResult.value = null;
+  activeChapter.value = 0;
   try {
-    result.value = await generatePackage({
-      chapter: chapter.value,
+    novelResult.value = await generateNovel({
+      novel_title: novelTitle.value,
+      content: content.value,
       character_hint: characterHint.value,
       prop_hint: propHint.value,
       scene_hint: sceneHint.value,
@@ -112,26 +118,38 @@ async function copy(text: string, key: string) {
 
 <template>
   <main class="wrap">
-    <h1>贴一段小说，出五类文生文描述</h1>
+    <h1>贴一部小说的若干章，按章出五类描述</h1>
     <p class="lead">
-      不用写提示词。后端先按技能规范盘出角色、角色道具、场景，再带着这份资产表写站位与
-      {{ targetDuration }}s 分镜组表——两段串行，保证分镜里的名字和资产表一字不差。
+      小说名独立填写，标题与正文贴同一个框。按「第X章」标题行确定性切分并逐字回拼，
+      通过后才交给 LangGraph 逐章生成：每章先盘资产，再带资产表写站位与
+      {{ targetDuration }}s 分镜组表。
     </p>
 
-    <label class="field-label" for="chapter">章节原文</label>
+    <label class="field-label" for="novel-title">小说名</label>
+    <input
+      id="novel-title"
+      class="title-input"
+      v-model="novelTitle"
+      placeholder="逐字保留，供后续资产归档使用"
+    />
+
+    <label class="field-label" for="content">章节原文（标题 + 正文，可多章）</label>
     <textarea
-      id="chapter"
-      v-model="chapter"
-      rows="7"
-      placeholder="把小说章节正文贴进来，逐字不改、不截断。"
+      id="content"
+      v-model="content"
+      rows="10"
+      placeholder="第一章：标题&#10;正文……&#10;&#10;第二章：标题&#10;正文……"
     ></textarea>
+    <p class="muted small hint-line">
+      标题必须独占一行且以「第X章」开头（章/回/节/部/篇/集均可）；正文里随口提到的章号不会被误切。
+    </p>
 
     <div class="actions">
       <button :disabled="loading" @click="run">
-        {{ loading ? "生成中…" : "生成五类描述" }}
+        {{ loading ? "生成中…" : "按章生成五类描述" }}
       </button>
       <span class="muted small">
-        2 次模型调用：盘资产 → 写站位与分镜。只想要资产可切「仅资产」，省一半。
+        每章 2 次模型调用：盘资产 → 写站位与分镜。只想要资产可切「仅资产」，省一半。
       </span>
     </div>
 
@@ -176,11 +194,11 @@ async function copy(text: string, key: string) {
         <span class="field-label">调用方式</span>
         <label>
           <input type="radio" value="auto" v-model="mode" />
-          出全五类 <span class="muted">（2 次调用，默认）</span>
+          出全五类 <span class="muted">（两段生成 + agent 编排，默认）</span>
         </label>
         <label>
           <input type="radio" value="assets_only" v-model="mode" />
-          仅资产 <span class="muted">（1 次，返修资产时用）</span>
+          仅资产 <span class="muted">（一段生成，返修资产时用）</span>
         </label>
         <label>
           <input type="radio" value="per_type" v-model="mode" />
@@ -229,38 +247,57 @@ async function copy(text: string, key: string) {
 
     <p v-if="error" class="err">{{ error }}</p>
 
-    <section v-if="result" class="result">
+    <section v-if="novelResult && current" class="result">
       <p class="meta">
-        run_id {{ result.run_id }} · {{ result.model }} ·
-        {{ result.mock ? "mock（未配密钥）" : "真实调用" }} ·
-        {{ result.latency_ms }}ms · 提示词 {{ result.prompt_version }} ·
-        {{ result.llm_calls }} 次调用 · 技能 {{ result.skills_loaded.join("、") || "未装载" }}
-        <template v-if="result.skills_refs_expanded">
-          （展开 {{ result.skills_refs_expanded }} 篇细则<template v-if="result.skills_refs_skipped"
-            >，{{ result.skills_refs_skipped }} 篇超预算</template
+        《{{ novelResult.novel_title }}》共 {{ novelResult.chapter_count }} 章 ·
+        {{ novelResult.total_llm_calls }} 次生成 +
+        {{ novelResult.total_agent_calls }} 次编排 · 合计 {{ novelResult.total_latency_ms }}ms ·
+        机检 {{ novelResult.gate_issue_count }} 项
+      </p>
+      <div class="chapter-tabs">
+        <button
+          v-for="ch in novelResult.chapters"
+          :key="ch.index"
+          class="tab"
+          :class="{ active: ch.index === current.index }"
+          @click="activeChapter = ch.index - 1"
+        >
+          {{ ch.index }}. {{ ch.title }}
+        </button>
+      </div>
+      <p class="meta">
+        《{{ current.title }}》原文 {{ current.text_chars }} 字 · {{ current.latency_ms }}ms ·
+        提示词 {{ current.prompt_version }} · 生成 {{ current.llm_calls }} 次 +
+        编排 {{ current.agent_calls }} 次 ·
+        技能 {{ current.skills_loaded.join("、") || "未装载" }} ·
+        run_id {{ novelResult.run_id }} · {{ novelResult.model }} ·
+        {{ novelResult.mock ? "mock（未配密钥）" : "真实调用" }}
+        <template v-if="current.skills_refs_expanded">
+          （展开 {{ current.skills_refs_expanded }} 篇细则<template v-if="current.skills_refs_skipped"
+            >，{{ current.skills_refs_skipped }} 篇超预算</template
           >）
         </template>
       </p>
 
-      <p v-if="result.injection_warning" class="warn">
+      <p v-if="current.injection_warning" class="warn">
         章节里检测到疑似指令式语句。已按「素材而非指令」处理，原文一字未改。
       </p>
-      <p v-if="result.skills_skipped.length" class="warn">
-        因篇幅预算未装载：{{ result.skills_skipped.join("、") }}
+      <p v-if="current.skills_skipped.length" class="warn">
+        因篇幅预算未装载：{{ current.skills_skipped.join("、") }}
       </p>
-      <p v-if="result.truncated" class="warn">
-        本章预估需 {{ result.total_groups_estimated }} 组，本次只出前
-        {{ result.storyboards.length }} 组（上限 {{ maxGroups }}）。调高「本次最多组数」或分段贴原文。
+      <p v-if="current.truncated" class="warn">
+        本章预估需 {{ current.total_groups_estimated }} 组，本次只出前
+        {{ current.storyboards.length }} 组（上限 {{ maxGroups }}）。调高「本次最多组数」或分段贴原文。
       </p>
-      <p v-if="result.gate_issues.length" class="warn">
-        机检提示 {{ result.gate_issues.length }} 项（不阻断，S5 正式门禁会拦）：
-        {{ result.gate_issues.map((i) => `${i.group_id} ${i.detail}`).join("；") }}
+      <p v-if="current.gate_issues.length" class="warn">
+        机检提示 {{ current.gate_issues.length }} 项（不阻断，S5 正式门禁会拦）：
+        {{ current.gate_issues.map((i) => `${i.group_id} ${i.detail}`).join("；") }}
       </p>
 
       <!-- 1 角色 -->
-      <h2 class="block-title">① 角色 <span class="count">{{ result.characters.length }}</span></h2>
+      <h2 class="block-title">① 角色 <span class="count">{{ current.characters.length }}</span></h2>
       <div class="cards">
-        <article v-for="c in result.characters" :key="c.name" class="card">
+        <article v-for="c in current.characters" :key="c.name" class="card">
           <header>
             <b>{{ c.name }}</b>
           </header>
@@ -281,9 +318,9 @@ async function copy(text: string, key: string) {
       </div>
 
       <!-- 2 角色道具 -->
-      <h2 class="block-title">② 角色道具 <span class="count">{{ result.props.length }}</span></h2>
+      <h2 class="block-title">② 角色道具 <span class="count">{{ current.props.length }}</span></h2>
       <div class="cards">
-        <article v-for="p in result.props" :key="p.name" class="card">
+        <article v-for="p in current.props" :key="p.name" class="card">
           <header>
             <b>{{ p.name }}</b>
             <span v-if="p.owner" class="badge">归属 {{ p.owner }}</span>
@@ -304,9 +341,9 @@ async function copy(text: string, key: string) {
       </div>
 
       <!-- 3 场景 -->
-      <h2 class="block-title">③ 场景 <span class="count">{{ result.scenes.length }}</span></h2>
+      <h2 class="block-title">③ 场景 <span class="count">{{ current.scenes.length }}</span></h2>
       <div class="cards">
-        <article v-for="s in result.scenes" :key="s.name" class="card">
+        <article v-for="s in current.scenes" :key="s.name" class="card">
           <header>
             <b>{{ s.name }}</b>
             <span class="badge gray">{{ s.time }}</span>
@@ -326,13 +363,13 @@ async function copy(text: string, key: string) {
       </div>
 
       <!-- 4 角色站位 -->
-      <template v-if="result.blockings.length">
+      <template v-if="current.blockings.length">
         <h2 class="block-title">
-          ④ 角色站位 <span class="count">{{ result.blockings.length }} 组</span>
+          ④ 角色站位 <span class="count">{{ current.blockings.length }} 组</span>
         </h2>
         <p class="note">从分镜表第十列聚合，不单独生成，所以永远和分镜一致。</p>
         <div class="groups">
-          <article v-for="b in result.blockings" :key="b.group_id" class="group">
+          <article v-for="b in current.blockings" :key="b.group_id" class="group">
             <header class="group-head">
               <b>{{ b.group_id }}</b>
               <span class="muted">{{ b.location }}</span>
@@ -343,16 +380,16 @@ async function copy(text: string, key: string) {
       </template>
 
       <!-- 5 15s 分镜 -->
-      <template v-if="result.storyboards.length">
+      <template v-if="current.storyboards.length">
         <h2 class="block-title">
           ⑤ {{ targetDuration }}s 分镜
           <span class="count">
-            {{ result.storyboards.length }} 组 / 共 {{ Math.round(totalSeconds) }}s
+            {{ current.storyboards.length }} 组 / 共 {{ Math.round(totalSeconds) }}s
           </span>
         </h2>
         <p class="note">组时长 = 各镜之和；单镜 ≥1.2s；固定机位写「机位固定」；台词逐字取自原文。</p>
         <div class="groups">
-          <article v-for="g in result.storyboards" :key="g.group_id" class="group">
+          <article v-for="g in current.storyboards" :key="g.group_id" class="group">
             <header class="group-head">
               <b>{{ g.group_id }}</b>
               <span class="badge">{{ g.duration }}s</span>
@@ -420,6 +457,37 @@ textarea {
 }
 textarea::placeholder {
   color: #b0b0b0;
+}
+.title-input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  font-size: 14px;
+  border: 1px solid #ddd;
+  border-radius: 10px;
+  font-family: inherit;
+}
+.hint-line {
+  margin: 6px 0 0;
+}
+.chapter-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.tab {
+  padding: 6px 12px;
+  font-size: 12px;
+  background: #fff;
+  color: #0c447c;
+  border: 1px solid #d6e2ef;
+  border-radius: 999px;
+}
+.tab.active {
+  background: #0c447c;
+  color: #fff;
 }
 .hint-grid {
   display: grid;

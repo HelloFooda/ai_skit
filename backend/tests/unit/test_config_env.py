@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.config import ENV_FILE, Settings
+from app.core.config import ENV_FILE, Settings
 
 
 class ConfigEnvFileTests(unittest.TestCase):

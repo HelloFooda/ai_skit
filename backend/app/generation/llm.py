@@ -6,8 +6,9 @@
   提示词正文与迁移前**逐字相同**，`PROMPT_VERSION` 因此不升版。
 - `chains.py`：模型工厂（配置驱动换厂商）、LCEL 链、`RunnableConfig`
   （超时/重试/标签/并发上限）、`UsageCollector`（token 按 stage 归因）。
-- `llm.py`（本文件）：只做业务编排——消息组装、两段执行、mock、元数据。
+- `llm.py`（本文件）：只做业务编排——消息组装、两段执行、元数据。
   章节原文仍由本文件逐字拼进 user 消息，**不进任何模板引擎**。
+  mock 样例数据在 `mock_data.py`，不在本文件里。
 
 ## 为什么是两段，而不是一次调用出五类
 
@@ -45,9 +46,8 @@ from dataclasses import dataclass, field
 
 from langchain_core.runnables import Runnable
 
-from . import chains, prompts
-from .config import settings
-from .schemas import (
+from ..core.config import settings
+from ..core.schemas import (
     Assets,
     Character,
     GateIssue,
@@ -58,7 +58,9 @@ from .schemas import (
     build_blockings,
     check_storyboards,
 )
-from .skills import SkillSection, build_skill_section, catalog
+from ..knowledge.skills import SkillSection, build_skill_section, catalog
+from . import chains, prompts
+from .mock_data import mock_package
 
 # 改提示词正文就升版本号，响应里会带回来，方便回归评测与 A/B 归因。
 # 迁到 ChatPromptTemplate 只换载体、正文逐字未变，所以仍是 v7。
@@ -388,98 +390,6 @@ def _run_visual(
     return groups, total, collector
 
 
-# mock 数据：没填 API key 时用它跑通前后端联调（五类齐全，含一处故意越界以便看到机检）
-_MOCK_ASSETS = Assets(
-    characters=[
-        Character(
-            name="林桂芳",
-            appearance="五十上下，短发齐耳，藏青工装外套洗得发白，裤脚沾着面灰",
-            stable_features="左眉一道浅疤；右手虎口有旧烫伤",
-            state="进店时外套肩头带雨气（场次 1 起），全章无换装",
-            voice="中低音，语速偏慢，句尾习惯性下沉",
-            prompt="五十上下的中年女性，身形偏瘦、肩背略佝，齐耳短发已掺灰白、发尾外翘；面容清瘦，左眉一道浅疤，右手虎口有旧烫伤；藏青工装外套洗得发白、袖口起毛，内衣领口露出灰布衬里，深色长裤裤脚沾着面灰，脚穿深色胶底布鞋；系一条蓝布围裙，布面有油渍与旧折痕",
-        ),
-        Character(
-            name="沈砚舟",
-            appearance="三十出头，黑色长风衣，金丝眼镜，头发梳得整齐",
-            stable_features="右手无名指一枚旧银戒；眼镜左片有细微裂痕",
-            state="全章无换装，外套扣子始终扣到第二颗",
-            voice="中音，语速平稳，咬字清楚，带一点疲惫",
-            prompt="三十出头的男性，身形清瘦挺拔、肩线平直；面容清隽，眉眼偏冷、鼻梁挺直，下颌线干净，黑发向后梳得整齐、鬓角利落；黑色及膝长风衣面料硬挺、肘部有轻微磨白，内穿深色高领毛衣，长裤裤线笔直，脚穿黑色皮鞋、鞋面擦得发亮；金丝眼镜左片有一道细微裂痕，右手无名指一枚旧银戒",
-        ),
-    ],
-    props=[
-        Prop(
-            name="铜钥匙",
-            owner="林桂芳",
-            appearance="老旧黄铜，掌心大小，边缘磨得发亮",
-            state_changes="从攥紧到插入锁孔",
-            prompt="黄铜钥匙，长约四指、齿纹深且边缘磨圆，通体氧化发暗、握持处被磨得发亮，钥匙环上串着一枚旧铜牌，牌面字迹已磨损不可辨",
-        ),
-        Prop(
-            name="怀表",
-            owner="沈砚舟",
-            appearance="银壳旧怀表，表盖有细密划痕",
-            state_changes="开合一次",
-            prompt="银壳怀表，直径约掌心的三分之二、壳面有细密划痕与浅坑，表盖铰链略松，打开后露出白色表盘与细黑指针，表冠有一圈防滑纹",
-        ),
-    ],
-    scenes=[
-        Scene(
-            name="老饭馆内景",
-            time="傍晚",
-            light="暖黄顶灯为主光，木门处透进一道冷调夕光",
-            atmosphere="烟火气、略嘈杂、桌椅陈旧",
-            prompt="老街饭馆内景，木桌木椅成排摆放、桌面有油渍与刀痕，靠门一侧是玻璃木格窗，吧台在内侧靠墙、台上摆着搪瓷碗与暖瓶，地面铺旧水磨石，墙面下半截刷绿漆、上半截露砖，天花板正中悬一盏暖黄吊灯",
-        )
-    ],
-)
-
-_MOCK_GROUPS = [
-    StoryboardGroup(
-        group_id="G01",
-        duration=15.0,
-        location="老饭馆内景",
-        summary="林桂芳推门进店，与沈砚舟照面",
-        shots=[
-            {
-                "shot_no": 1,
-                "duration": 4.0,
-                "shot_size": "全景",
-                "angle": "平视",
-                "camera": "机位固定",
-                "function": "交代环境",
-                "content": "木门被推开，林桂芳跨进门槛，暖黄顶灯把她整个人笼住",
-                "dialogue": "",
-                "blocking": "林桂芳｜画面左侧三分之一、近门处｜朝向画面内（右）｜机位在轴线左侧",
-            },
-            {
-                "shot_no": 2,
-                "duration": 5.0,
-                "shot_size": "中景",
-                "angle": "过肩",
-                "camera": "缓慢右摇",
-                "function": "推进",
-                "content": "越过林桂芳肩头，沈砚舟在柜台后低头擦怀表，抬眼",
-                "dialogue": "你怎么来了。",
-                "blocking": "沈砚舟｜画面右侧、柜台后｜朝向画面外（左）｜机位仍在轴线左侧",
-            },
-            {
-                "shot_no": 3,
-                "duration": 6.0,
-                "shot_size": "近景",
-                "angle": "平视",
-                "camera": "机位固定",
-                "function": "反应",
-                "content": "林桂芳摊开手掌，铜钥匙在灯下发亮，她攥紧",
-                "dialogue": "钥匙我一直留着。",
-                "blocking": "林桂芳｜画面居中偏左｜朝向画面内（右）｜机位在轴线左侧",
-            },
-        ],
-    )
-]
-
-
 @dataclass
 class ExtractionResult:
     """一次生成的产物 + 可观测元数据（便于评测归因与成本核算）。"""
@@ -500,21 +410,6 @@ class ExtractionResult:
     gate_issues: list[GateIssue] = field(default_factory=list)
     total_groups_estimated: int = 0
     truncated: bool = False
-
-
-def _mock_package(mode: str) -> ScriptPackage:
-    assets = _MOCK_ASSETS
-    if mode == "assets_only":
-        return ScriptPackage(
-            characters=assets.characters, props=assets.props, scenes=assets.scenes
-        )
-    return ScriptPackage(
-        characters=assets.characters,
-        props=assets.props,
-        scenes=assets.scenes,
-        blockings=build_blockings(_MOCK_GROUPS),
-        storyboards=_MOCK_GROUPS,
-    )
 
 
 def extract_assets(
@@ -564,7 +459,7 @@ def extract_assets(
 
     if settings.mock or not settings.api_key:
         time.sleep(0.2)
-        package = _mock_package("auto" if mode == "visual_only" else mode)
+        package = mock_package("auto" if mode == "visual_only" else mode)
         return ExtractionResult(
             package=package,
             mock=True,

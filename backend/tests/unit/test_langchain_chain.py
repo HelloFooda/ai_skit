@@ -18,8 +18,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_openai import ChatOpenAI
 
-from app import chains, llm, prompts
-from app.config import settings
+from app.core.config import settings
+from app.generation import chains, llm, prompts
 from tests.unit import prompt_baseline_v7 as baseline
 
 CHAPTER = "林桂芳推开老饭馆的木门，铜钥匙在掌心攥得发烫。"

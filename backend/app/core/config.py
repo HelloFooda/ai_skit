@@ -5,7 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 项目唯一的配置文件。锚定 backend/ 而不是工作目录，
 # 这样从仓库根目录或 backend/ 启动读到的都是同一份 .env。
-ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+# 本文件在 app/core/ 下，回退三层才是 backend/。
+ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -36,6 +37,13 @@ class Settings(BaseSettings):
     timeout: float = Field(default=120.0, gt=0, description="单次请求超时秒数")
     max_retries: int = Field(default=2, ge=0, le=10, description="SDK 内置重试次数")
     max_concurrency: int = Field(default=3, ge=1, le=16, description="Runnable.batch 并发上限")
+
+    # ---- 日志：分级落盘，默认只记 INFO 到 stderr；分析提示词时把 LEVEL 调到 DEBUG。
+    # log_dir 留空表示只写 stderr；给定目录则额外写 ai_skit.log（JSON 行 + 轮转）。
+    log_level: str = "INFO"
+    log_dir: str = ""
+    log_rotate: str = "10 MB"
+    log_retention: str = "7 days"
 
     # ---- 技能库根目录；留空则用 backend/skills
     skills_dir: str = ""

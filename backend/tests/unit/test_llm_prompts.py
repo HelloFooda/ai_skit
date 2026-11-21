@@ -12,9 +12,8 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from app import llm
-from app.routers.pipeline import run
-from app.schemas import (
+from app.api.pipeline import run
+from app.core.schemas import (
     Assets,
     Character,
     ExtractAssetsRequest,
@@ -25,6 +24,8 @@ from app.schemas import (
     build_blockings,
     check_storyboards,
 )
+from app.generation import llm
+from app.generation.mock_data import mock_package
 
 CHAPTER = "林桂芳推开老饭馆的木门，铜钥匙在掌心攥得发烫。"
 HINTS = {
@@ -601,7 +602,7 @@ class AssetPromptStageBoundaryTests(unittest.TestCase):
     def test_mock_samples_follow_the_same_boundary(self):
         # mock 产出会在前端当示例展示，口径必须与新提示词一致，
         # 否则等于用样例把「画风/画幅/景别」重新教给用户。
-        package = llm._mock_package("auto")
+        package = mock_package("auto")
         items = [*package.characters, *package.props, *package.scenes]
         self.assertTrue(items)
         for item in items:

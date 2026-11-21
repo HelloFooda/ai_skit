@@ -1,13 +1,13 @@
 # ai_skit frontend
 
-最小前后端闭环的前端。输入小说章节 → 调后端 → 展示抽取出的角色 / 道具 / 场景。
+Vue 3 + Vite + TypeScript 前端：输入小说章节 → 调后端 → 展示五类产出。
 
-## 跑起来
+- 组件结构、API 封装、请求与响应字段：见[前端技术文档](../docs/frontend.md)。
+- 产品效果与快速开始：见[根 README](../README.md)。
+
+最小启动：
 
 ```bash
-cd frontend
 npm install
-npm run dev
+npm run dev        # http://localhost:5173，/api 代理到后端 8000
 ```
-
-打开 http://localhost:5173 。后端先起（见 `backend/README.md`），`/api` 已代理到 8000 端口。

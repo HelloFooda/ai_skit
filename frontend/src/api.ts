@@ -124,6 +124,8 @@ export interface GenerateResponse {
   prompt_version: string;
   mode: ExtractMode;
   llm_calls: number;
+  /** agent 编排自己发起的模型调用（选工具 / 收尾），与生成的 llm_calls 分开计 */
+  agent_calls: number;
   hints_used: string[];
   injection_warning: boolean;
   skills_loaded: string[];
@@ -153,6 +155,80 @@ export async function listSkills(categories?: string[]): Promise<SkillCatalogRes
 
 export async function generatePackage(req: GenerateRequest): Promise<GenerateResponse> {
   const res = await fetch("/api/pipeline/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "请求失败");
+  }
+  return res.json();
+}
+
+/** 多章编排只放开三种模式；visual_only 依赖单章外部资产表，逐章生成时语义不成立 */
+export type NovelExtractMode = "auto" | "assets_only" | "per_type";
+
+export interface NovelGenerateRequest {
+  novel_title: string;
+  /** 若干章的「标题行 + 正文」，标题独占一行、从「第X章」开头 */
+  content: string;
+  character_hint?: string;
+  prop_hint?: string;
+  scene_hint?: string;
+  mode?: NovelExtractMode;
+  target_duration?: number;
+  max_groups?: number;
+  skills?: string[];
+  scene_filter?: string[];
+}
+
+export interface ChapterOutput {
+  index: number;
+  title: string;
+  text_chars: number;
+  characters: Character[];
+  props: Prop[];
+  scenes: Scene[];
+  blockings: Blocking[];
+  storyboards: StoryboardGroup[];
+  latency_ms: number;
+  prompt_version: string;
+  mode: string;
+  llm_calls: number;
+  agent_calls: number;
+  hints_used: string[];
+  injection_warning: boolean;
+  skills_loaded: string[];
+  skills_skipped: string[];
+  skills_refs_expanded: number;
+  skills_refs_skipped: number;
+  stages: Record<string, unknown>[];
+  gate_issues: GateIssue[];
+  total_groups_estimated: number;
+  truncated: boolean;
+}
+
+export interface NovelGenerateResponse {
+  run_id: string;
+  model: string;
+  mock: boolean;
+  novel_title: string;
+  chapter_count: number;
+  chapters: ChapterOutput[];
+  total_llm_calls: number;
+  total_agent_calls: number;
+  total_latency_ms: number;
+  total_characters: number;
+  total_props: number;
+  total_scenes: number;
+  total_storyboards: number;
+  injection_warning: boolean;
+  gate_issue_count: number;
+}
+
+export async function generateNovel(req: NovelGenerateRequest): Promise<NovelGenerateResponse> {
+  const res = await fetch("/api/pipeline/generate-novel", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),

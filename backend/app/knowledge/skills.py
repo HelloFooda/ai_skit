@@ -33,7 +33,9 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import settings
+import yaml
+
+from ..core.config import settings
 
 # 单技能块（正文 + 展开的 references）上限；超出即整体跳过，不切片
 MAX_SKILL_BLOCK_CHARS = 32_000
@@ -49,8 +51,6 @@ ALLOWED_CATEGORIES = frozenset(
 )
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-_KV_RE = re.compile(r"^[A-Za-z0-9_.\-]+\s*:")
-_BLOCK_SCALAR = frozenset({">", "|", ">-", "|-", ">+", "|+"})
 # Markdown 链接：[文本](目标 "标题")；目标里允许锚点 #xxx
 _LINK_RE = re.compile(r"\[[^\]]*\]\(\s*([^)\s]+?)(?:\s+\"[^\"]*\")?\s*\)")
 
@@ -94,130 +94,49 @@ class SkillSection:
 
 
 # --------------------------------------------------------------------------
-# 最小 YAML 解析（只服务 frontmatter 与 openai.yaml，不引 PyYAML）
+# YAML 解析（标准 PyYAML，不再自己写解析器）
 # --------------------------------------------------------------------------
 
 
-def _unquote(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
-    return value
+def _load_yaml(text: str) -> dict[str, object]:
+    """解析 frontmatter 量级的 YAML，顶层必须是键值映射。
+
+    通用技能会把 `description` 写成 `>-` 折叠块或缩进续写，类别写成行内列表——
+    这些都是标准 YAML 语法，交给 PyYAML 比手写解析器少一整类边界 bug。
+    """
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"YAML 解析失败：{exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        # 这里判的是 YAML **内容形状**（frontmatter 必须是映射），不是调用方传错类型，
+        # 所以仍用 ValueError：上层统一按「格式坏」处理，不区分 TypeError。
+        raise ValueError("frontmatter 必须是键值映射（key: value）")  # noqa: TRY004
+    return data
+
+
+def _as_text(value: object) -> str:
+    """统一转字符串：下游字段都是 str，而 YAML 会把 yes/no 读成 bool、1.0 读成 float。
+
+    列表按逗号拼接，正好是 `_split_list` 的输入口径（类别声明随后会被拆回元组）。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_as_text(item) for item in value)
+    return str(value).strip()
 
 
 def _split_list(value: str) -> tuple[str, ...]:
+    """把 `[a, b]` / `a, b` / `a b` 都拆成元组；行内列表已由 YAML 展开过一次。"""
     value = value.strip().strip("[]")
     return tuple(
         item.strip().strip("\"'") for item in re.split(r"[,\s]+", value) if item.strip()
     )
-
-
-def _collect_indented(lines: list[str], start: int) -> tuple[list[str], int]:
-    """收集 start 起所有缩进行（含空行），返回 (块, 下一游标)。"""
-    block: list[str] = []
-    i, n = start, len(lines)
-    while i < n:
-        line = lines[i]
-        if not line.strip():
-            block.append("")
-            i += 1
-            continue
-        if line[:1] in (" ", "\t"):
-            block.append(line)
-            i += 1
-            continue
-        break
-    while block and not block[-1].strip():
-        block.pop()
-    return block, i
-
-
-def _deindent(block: list[str]) -> list[str]:
-    indents = [len(line) - len(line.lstrip()) for line in block if line.strip()]
-    cut = min(indents) if indents else 0
-    return [line[cut:] if len(line) >= cut else "" for line in block]
-
-
-def _fold(block: list[str], style: str) -> str:
-    """处理 | 与 > 两种块标量：竖线保换行，尖括号折叠成空格、空行分段。"""
-    lines = _deindent(block)
-    if style.startswith("|"):
-        text = "\n".join(lines)
-    else:
-        paras: list[str] = []
-        cur: list[str] = []
-        for line in lines:
-            if line.strip():
-                cur.append(line.strip())
-            elif cur:
-                paras.append(" ".join(cur))
-                cur = []
-        if cur:
-            paras.append(" ".join(cur))
-        text = "\n\n".join(paras)
-    # `-`（strip）与 `+`（keep）在提示词场景无差别，统一去掉首尾空行
-    return text.strip()
-
-
-def parse_yaml_lite(text: str) -> dict[str, object]:
-    """解析 frontmatter 量级的 YAML：支持嵌套一层、块标量、多行续写、行内列表。
-
-    刻意不引 PyYAML：这里只需要扁平键值，多一个依赖不划算。通用技能的
-    `description` 常写成 `>-` 折叠块或多行续写，所以必须支持，否则会静默丢字。
-    """
-    lines = text.splitlines()
-    out: dict[str, object] = {}
-    i, n = 0, len(lines)
-    while i < n:
-        raw = lines[i]
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            i += 1
-            continue
-        if raw[:1] in (" ", "\t"):
-            i += 1  # 顶层意外缩进，忽略
-            continue
-        key, sep, value = raw.partition(":")
-        if not sep:
-            i += 1
-            continue
-        key = key.strip().strip("\"'")
-        value = value.strip()
-
-        if value in _BLOCK_SCALAR:
-            block, i = _collect_indented(lines, i + 1)
-            out[key] = _fold(block, value)
-            continue
-
-        if value:
-            # 缩进续写的普通标量：YAML 会把下面缩进行折叠进同一个值
-            block, nxt = _collect_indented(lines, i + 1)
-            cont_lines = [line for line in block if line.strip()]
-            if cont_lines and not all(_KV_RE.match(line.strip()) for line in cont_lines):
-                out[key] = (_unquote(value) + " " + " ".join(l.strip() for l in cont_lines)).strip()
-                i = nxt
-                continue
-            out[key] = _unquote(value)
-            i += 1
-            continue
-
-        # 空值：可能是嵌套 map，也可能是多行 plain 标量的第一层
-        block, nxt = _collect_indented(lines, i + 1)
-        if not block:
-            out[key] = ""
-            i = nxt
-            continue
-        sub_lines = [line for line in block if line.strip()]
-        if sub_lines and all(_KV_RE.match(line.strip()) for line in sub_lines):
-            sub: dict[str, str] = {}
-            for line in _deindent(sub_lines):
-                k, s, v = line.partition(":")
-                if s and k.strip():
-                    sub[k.strip().strip("\"'")] = _unquote(v)
-            out[key] = sub
-        else:
-            out[key] = " ".join(line.strip() for line in sub_lines)
-        i = nxt
-    return out
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -227,14 +146,14 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
         raise ValueError("缺少 YAML frontmatter（--- 包裹的 name / description）")
 
     raw, body = match.group(1), match.group(3) or ""
-    parsed = parse_yaml_lite(raw)
+    parsed = _load_yaml(raw)
     flat: dict[str, str] = {}
     for key, value in parsed.items():
         if isinstance(value, dict):
             for sub_key, sub_value in value.items():
-                flat[f"{key}.{sub_key}"] = str(sub_value)
+                flat[f"{key}.{sub_key}"] = _as_text(sub_value)
         else:
-            flat[key] = str(value)
+            flat[str(key)] = _as_text(value)
     return flat, body.strip()
 
 
@@ -247,7 +166,7 @@ def default_root() -> Path:
     """默认 backend/skills；可用配置 LLM_SKILLS_DIR 覆盖。"""
     if settings.skills_dir:
         return Path(settings.skills_dir).expanduser().resolve()
-    return Path(__file__).resolve().parent.parent / "skills"
+    return Path(__file__).resolve().parent.parent.parent / "skills"
 
 
 def bindings_path(root: Path | None = None) -> Path:
@@ -264,14 +183,14 @@ def load_bindings(root: Path | None = None) -> dict[str, tuple[str, ...]]:
     if not path.is_file():
         return {}
     try:
-        parsed = parse_yaml_lite(path.read_text(encoding="utf-8"))
+        parsed = _load_yaml(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - 绑定表坏了不该拖垮技能库
         return {}
     table: dict[str, tuple[str, ...]] = {}
     for key, value in parsed.items():
         if isinstance(value, dict):
             continue
-        cats = _split_list(str(value))
+        cats = _split_list(_as_text(value))
         if cats:
             table[key] = cats
     return table
@@ -283,13 +202,13 @@ def _read_openai_meta(skill_dir: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
     try:
-        parsed = parse_yaml_lite(path.read_text(encoding="utf-8"))
+        parsed = _load_yaml(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return {}
     interface = parsed.get("interface")
     if not isinstance(interface, dict):
         return {}
-    return {key: str(value) for key, value in interface.items()}
+    return {str(key): _as_text(value) for key, value in interface.items()}
 
 
 def _local_refs(body: str) -> tuple[str, ...]:

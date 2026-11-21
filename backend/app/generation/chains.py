@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 from typing import Any
 from uuid import UUID
 
@@ -36,7 +37,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.outputs import LLMResult
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 
-from .config import settings
+from ..core.config import settings
+from ..observability.logging import LoggingCallback, get_request_id
+from ..observability.usage import token_usage
 
 # 业务侧消息是 list[dict]，在这里一次性转成 LangChain Message。
 # 未知 role 直接报错，不静默降级成 HumanMessage（那会改变规则/素材的权限层级）。
@@ -46,16 +49,11 @@ _ROLE_MAP = {
     "assistant": AIMessage,
 }
 
-# 模型对象按配置快照缓存：避免每个请求重建 HTTP client / 连接池。
-# 改 .env 后重启进程即生效；测试里 patch settings 后需调用 clear_model_cache()。
-_MODEL_CACHE: dict[tuple[object, ...], BaseChatModel] = {}
-_CHAIN_CACHE: dict[tuple[object, ...], Runnable[list[dict[str, str]], str]] = {}
-
 
 def clear_model_cache() -> None:
     """配置变化后清空模型与链缓存（测试 / 运行时热更新用）。"""
-    _MODEL_CACHE.clear()
-    _CHAIN_CACHE.clear()
+    _cached_model.cache_clear()
+    _cached_chain.cache_clear()
 
 
 def _fingerprint(secret: str) -> str:
@@ -64,6 +62,7 @@ def _fingerprint(secret: str) -> str:
 
 
 def _model_key() -> tuple[object, ...]:
+    """配置快照即缓存键；密钥只进指纹，明文不进 key、不进日志。"""
     return (
         settings.provider,
         settings.model,
@@ -75,20 +74,12 @@ def _model_key() -> tuple[object, ...]:
     )
 
 
-def build_chat_model() -> BaseChatModel:
-    """按配置装配 ChatModel。业务代码不写死厂商。
+@lru_cache(maxsize=8)
+def _cached_model(key: tuple[object, ...]) -> BaseChatModel:
+    """按配置快照缓存模型对象：避免每个请求重建 HTTP client / 连接池。
 
-    统一走 `init_chat_model` 按 provider 名装配，只有 `base_url` 需要分流：
-    它是 OpenAI 兼容端点（DeepSeek / 通义 / vLLM / Ollama）专属参数，传给
-    `anthropic` / `google_genai` 之类会变成各 SDK 不认识的 kwarg。
-    非 openai 的 provider 需另装对应集成包（`langchain-anthropic`、
-    `langchain-google-genai` 等）。
+    改 .env 后重启进程即生效；测试里 patch settings 后需调用 clear_model_cache()。
     """
-    key = _model_key()
-    cached = _MODEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     kwargs: dict[str, Any] = {
         "api_key": settings.api_key,
         "temperature": settings.temperature,
@@ -98,10 +89,19 @@ def build_chat_model() -> BaseChatModel:
     if settings.provider == "openai":
         # 兼容端点的自定义地址；其它厂商交给集成包自己的默认地址。
         kwargs["base_url"] = settings.base_url
-    model = init_chat_model(settings.model, model_provider=settings.provider, **kwargs)
+    return init_chat_model(settings.model, model_provider=settings.provider, **kwargs)
 
-    _MODEL_CACHE[key] = model
-    return model
+
+def build_chat_model() -> BaseChatModel:
+    """按配置装配 ChatModel。业务代码不写死厂商。
+
+    统一走 `init_chat_model` 按 provider 名装配，只有 `base_url` 需要分流：
+    它是 OpenAI 兼容端点（DeepSeek / 通义 / vLLM / Ollama）专属参数，传给
+    `anthropic` / `google_genai` 之类会变成各 SDK 不认识的 kwarg。
+    非 openai 的 provider 需另装对应集成包（`langchain-anthropic`、
+    `langchain-google-genai` 等）。
+    """
+    return _cached_model(_model_key())
 
 
 def _to_messages(payload: list[dict[str, str]]) -> list[BaseMessage]:
@@ -132,30 +132,29 @@ def _to_text(message: Any) -> str:
     return message if isinstance(message, str) else str(message)
 
 
+@lru_cache(maxsize=8)
+def _cached_chain(key: tuple[object, ...]) -> Runnable[list[dict[str, str]], str]:
+    """链对象按同一份配置快照缓存：链是无状态的，重建只是浪费。"""
+    return (
+        RunnableLambda(_to_messages).with_config(run_name="ai_skit.to_messages")
+        | build_chat_model()
+        | RunnableLambda(_to_text).with_config(run_name="ai_skit.to_text")
+    )
+
+
 def build_chain() -> Runnable[list[dict[str, str]], str]:
     """LCEL 链：dict 消息 → Message → ChatModel → 纯文本。
 
     输出仍交给 `llm._parse_json` 做容错解析 + Pydantic 强校验，
     所以提示词口径与输出契约一点没变（见模块 docstring 第 1 条）。
     """
-    key = _model_key()
-    cached = _CHAIN_CACHE.get(key)
-    if cached is not None:
-        return cached
-    chain: Runnable[list[dict[str, str]], str] = (
-        RunnableLambda(_to_messages).with_config(run_name="ai_skit.to_messages")
-        | build_chat_model()
-        | RunnableLambda(_to_text).with_config(run_name="ai_skit.to_text")
-    )
-    _CHAIN_CACHE[key] = chain
-    return chain
+    return _cached_chain(_model_key())
 
 
 class UsageCollector(BaseCallbackHandler):
     """采集一次 / 一批调用的 token 用量，供 `stages` 按段归因。
 
-    优先取 `ChatGeneration.message.usage_metadata`（LangChain 1.x 标准字段）；
-    老集成包只给 `llm_output["token_usage"]` 时回退，且不会重复累加。
+    提取规则在 `observability.usage`（与落盘日志共用一份），这里只负责累加。
     """
 
     def __init__(self) -> None:
@@ -174,28 +173,11 @@ class UsageCollector(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         self.calls += 1
-        counted = False
-        for generations in response.generations:
-            for generation in generations:
-                metadata = getattr(getattr(generation, "message", None), "usage_metadata", None)
-                if not metadata:
-                    continue
-                self._add(
-                    metadata.get("input_tokens"),
-                    metadata.get("output_tokens"),
-                    metadata.get("total_tokens"),
-                )
-                counted = True
-        if counted:
-            return
-        # 兼容只把用量放在 llm_output 里的集成包
-        usage = (response.llm_output or {}).get("token_usage") or {}
-        if usage:
-            self._add(
-                usage.get("prompt_tokens") or usage.get("input_tokens"),
-                usage.get("completion_tokens") or usage.get("output_tokens"),
-                usage.get("total_tokens"),
-            )
+        usage = token_usage(response)
+        if usage.found:
+            self.input_tokens += usage.input_tokens
+            self.output_tokens += usage.output_tokens
+            self.total_tokens += usage.total_tokens
 
     def on_llm_error(
         self,
@@ -206,16 +188,6 @@ class UsageCollector(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         self.errors += 1
-
-    def _add(self, input_tokens: Any, output_tokens: Any, total_tokens: Any) -> None:
-        try:
-            in_t = int(input_tokens or 0)
-            out_t = int(output_tokens or 0)
-        except (TypeError, ValueError):
-            return
-        self.input_tokens += in_t
-        self.output_tokens += out_t
-        self.total_tokens += int(total_tokens or 0) if total_tokens is not None else in_t + out_t
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -249,10 +221,14 @@ def run_config(
             "prompt_version": prompt_version,
             "model": settings.model,
             "provider": settings.provider,
+            "run_id": get_request_id(),
         },
     }
+    # 两个回调各司其职：UsageCollector 汇总进响应，LoggingCallback 落盘给人排查。
+    callbacks: list[Any] = [LoggingCallback()]
     if collector is not None:
-        config["callbacks"] = [collector]
+        callbacks.append(collector)
+    config["callbacks"] = callbacks
     if max_concurrency is not None:
         config["max_concurrency"] = max_concurrency
     return config

@@ -14,15 +14,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app import llm, skills
-from app.config import settings
-from app.skills import (
+from app.core.config import settings
+from app.generation import llm
+from app.knowledge import skills
+from app.knowledge.skills import (
     UnknownSkillError,
     build_skill_section,
     load_all,
     load_skill,
     parse_frontmatter,
-    parse_yaml_lite,
 )
 
 VALID = """---
@@ -98,9 +98,21 @@ class FrontmatterTests(unittest.TestCase):
         self.assertEqual(meta["description"], "前半句。 后半句。")
 
     def test_inline_list_and_comment_lines(self):
-        parsed = parse_yaml_lite("# 注释\nname: a-b\napplies-to: [characters, props]\n")
-        self.assertEqual(parsed["name"], "a-b")
-        self.assertEqual(parsed["applies-to"], "[characters, props]")
+        """行内列表由 YAML 展开成列表，扁平化后按逗号拼回字符串。"""
+        meta, _ = parse_frontmatter(
+            "---\n# 注释\nname: a-b\ndescription: 说明\napplies-to: [characters, props]\n---\n正文"
+        )
+        self.assertEqual(meta["name"], "a-b")
+        self.assertEqual(meta["applies-to"], "characters, props")
+
+    def test_scalar_types_are_normalized_to_text(self):
+        """YAML 会把 yes/no 读成 bool、1.0 读成 float；元数据字段统一要 str。"""
+        meta, _ = parse_frontmatter("---\nname: x-y\ndescription: 说明\nno_ads: yes\n---\n正文")
+        self.assertEqual(meta["no_ads"], "true")
+
+    def test_invalid_yaml_is_reported_not_silently_dropped(self):
+        with self.assertRaisesRegex(ValueError, "YAML"):
+            parse_frontmatter("---\nname: [未闭合\n---\n正文")
 
 
 class LoadSkillTests(unittest.TestCase):
@@ -403,7 +415,7 @@ class PromptIntegrationTests(unittest.TestCase):
 
 class RouterTests(unittest.TestCase):
     def test_menu_returns_metadata_without_body(self):
-        from app.routers.pipeline import list_skills
+        from app.api.pipeline import list_skills
 
         resp = list_skills(None)
         self.assertTrue(resp.skills)
@@ -413,7 +425,7 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(resp.errors, [])
 
     def test_menu_filter_uses_declared_categories(self):
-        from app.routers.pipeline import list_skills
+        from app.api.pipeline import list_skills
 
         resp = list_skills("characters")
         self.assertTrue(resp.skills)
@@ -421,19 +433,22 @@ class RouterTests(unittest.TestCase):
             self.assertIn("characters", item.categories)
 
     def test_unknown_skill_yields_400_not_500(self):
-        from fastapi import HTTPException
+        """技能名写错属于请求问题：全局异常处理器给 400，不是 500。"""
+        from fastapi.testclient import TestClient
 
-        from app.routers.pipeline import run
-        from app.schemas import ExtractAssetsRequest
+        from app.main import app
 
-        req = ExtractAssetsRequest(chapter="林桂芳推开老木门，铜钥匙发烫。", skills=["no-such-skill"])
-        with self.assertRaises(HTTPException) as ctx:
-            run(req)
-        self.assertEqual(ctx.exception.status_code, 400)
+        client = TestClient(app)
+        res = client.post(
+            "/api/pipeline/generate",
+            json={"chapter": "林桂芳推开老木门，铜钥匙发烫。", "skills": ["no-such-skill"]},
+        )
+        self.assertEqual(res.status_code, 400, res.text)
+        self.assertIn("未找到技能", res.json()["detail"])
 
     def test_response_reports_skills_and_refs(self):
-        from app.routers.pipeline import run
-        from app.schemas import ExtractAssetsRequest
+        from app.api.pipeline import run
+        from app.core.schemas import ExtractAssetsRequest
 
         with patch.object(llm.settings, "mock", True):
             resp = run(ExtractAssetsRequest(chapter="林桂芳推开老木门，铜钥匙发烫。"))
