@@ -17,7 +17,7 @@ uv run python -V       # Python 3.12.16，别直接敲 python3
 项目内的命令一律加 `uv run`（自动用这个 venv，无需手动 activate）：
 
 ```bash
-uv run uvicorn app.main:app --reload --port 8000
+uv run uvicorn app.main:app --reload --port 8001
 uv run python -m unittest discover -s tests                 # 全量单测，124 个
 uv run ruff check app tests                                # 门禁；ruff 已锁在 dev 组，不必再 uvx
 uv run python skills/short-drama/scripts/creator_markdown_check.py 剧集/EP001 --project-root .. --partial
@@ -61,11 +61,43 @@ LLM_SKILLS_DIR=
 LLM_SKILLS_BINDINGS=
 # 一次注入的技能总字数预算（0 表示用默认 60000）
 LLM_SKILLS_BUDGET_CHARS=60000
+# 资产归档根目录，留空则用 <仓库>/assets（generate-novel 自动落盘）
+LLM_ASSET_ROOT=
+
+# ---- 出图通道（S7 设定图），前缀 MEDIA_，与上面的 LLM_ 互不干扰 ----
+# provider 名：fixture（离线假图，默认）/ ark（火山方舟 Seedream）。
+# 厂商名只出现在 app/media/providers/ 里，业务层不认识任何厂商。
+MEDIA_IMAGE_PROVIDER=fixture
+# 模型名或接入点 ID；留空时由 provider 用自己的默认值
+MEDIA_IMAGE_MODEL=
+# OpenAI 兼容端点；留空时由 provider 用自己的默认地址
+MEDIA_IMAGE_BASE_URL=
+# 图片通道的 key；留空时回退 ARK_API_KEY，再留空则本地预检直接报错（不核销确认码）
+MEDIA_IMAGE_API_KEY=
+# 画幅：档位（1K/1.5K/2K/3K/4K）或 "宽x高"（如 2048x1152），两者互斥
+MEDIA_IMAGE_SIZE=2K
+# 画幅比例，作为技术参数传给 provider，不写进提示词正文
+MEDIA_IMAGE_RATIO=16:9
+# 水印必须显式关掉：多数厂商默认带水印
+MEDIA_IMAGE_WATERMARK=false
+# 单次请求超时 / SDK 重试次数 / 批量并发 / 异步轮询间隔与最长等待
+MEDIA_TIMEOUT=180
+MEDIA_MAX_RETRIES=1
+MEDIA_MAX_CONCURRENCY=2
+MEDIA_POLL_INTERVAL=5
+MEDIA_POLL_TIMEOUT=1800
+# 每日最多提交次数，0 表示不限；只拦提交，不拦取回
+MEDIA_DAILY_QUOTA=0
+# ★ 第二道钱闸门：false 时拒绝装配任何真实厂商，只允许离线 fixture
+MEDIA_ALLOW_PAID=false
+# 单张图预估成本，仅用于预览展示，不参与计费
+MEDIA_COST_PER_IMAGE=0
 ```
 
 - 未填 key：自动 mock，返回五类假数据，用于跑通前后端联调与演示。
 - 填了 key：真实调用 LLM。模型统一由 `init_chat_model` 按 `LLM_PROVIDER` 装配；默认 `openai` 额外带 `LLM_BASE_URL`，覆盖 DeepSeek / 通义 / vLLM 等一切 OpenAI 兼容端点。
 - 通道参数默认值：`LLM_TEMPERATURE` 0.2、`LLM_TIMEOUT` 120 秒、`LLM_MAX_RETRIES` 2、`LLM_MAX_CONCURRENCY` 3。改完 `.env` 重启进程生效。
+- **出图通道默认不花钱**：`MEDIA_IMAGE_PROVIDER=fixture` + `MEDIA_ALLOW_PAID=false` 时只会生成离线占位图，单测与联调都跑这条路。要真实出图必须同时改两处（`PROVIDER` 换成真实厂商、`ALLOW_PAID=true`），并已填好 key。
 
 ## 接口
 
@@ -74,8 +106,25 @@ LLM_SKILLS_BUDGET_CHARS=60000
 | GET | `/api/health` | 健康检查 |
 | GET | `/api/pipeline/skills?categories=characters,scenes` | 技能菜单（仅元数据，供前端勾选） |
 | POST | `/api/pipeline/generate-novel` | 多章主路径：小说名 + 若干章 → LangGraph 逐章出五类 |
+| POST | `/api/pipeline/generate-novel/stream` | 同上，但用 SSE 逐阶段回报进度（前端默认走这条） |
 | POST | `/api/pipeline/generate` | 单章兼容路径，出五类 |
 | POST | `/api/pipeline/extract-assets` | 兼容别名（已标记 deprecated） |
+| GET | `/api/assets/novels` | 资产库：列出已归档小说（目录名 + 三态计数 + 章节数） |
+| GET | `/api/assets/novels/{novel}/prompts` | 某小说的提示词条目清单（不含正文） |
+| GET | `/api/assets/novels/{novel}/chapters` | 某小说的章节目录与其下文档（`角色站位.md` / `分镜.md`，只列文件名） |
+| GET | `/api/assets/novels/{novel}/document?path=` | 读任意归档 Markdown（章节文档只读；`path` 必须落在小说目录内且为 `.md`） |
+| GET | `/api/assets/prompts/{id}` | 单条提示词全文 + 模板对照副本 |
+| PUT | `/api/assets/prompts/{id}` | 保存编辑：`{"body": "..."}`，结构校验 + 原子写，置 edited |
+| POST | `/api/assets/prompts/{id}/approve` | 定稿：edited → approved |
+| POST | `/api/assets/prompts/{id}/regenerate` | 采用 `.generated.md` 模板版本，回到 draft |
+| POST | `/api/media/preview` | 出图第一步：算账（不花钱）→ 返回指纹、确认码、阻塞项、额度、是否已有同参数成品 |
+| POST | `/api/media/generate` | 出图第三步：带确认码提交，SSE 逐张回推（`progress` → `media` → `done`） |
+| POST | `/api/media/collect` | 取回已提交的异步任务产物；**绝不重复提交**，所以不受额度限制 |
+| GET | `/api/media/jobs` | 任务列表（可按 `novel` / `prompt_id` / `state` 过滤），看状态与失败原因 |
+| GET | `/api/media/images?novel=&prompt_id=` | 某小说（或某条目）已出的全部版本 + 当前正文 hash |
+| POST | `/api/media/images/{id}/select` | 切换当前选用版：同条目其它版本自动取消选用，旧图不删 |
+| GET | `/api/media/images/{id}/sidecar` | 读该版本的技术档案（指纹/模型/参数/seed/成本/耗时） |
+| GET | `/api/media/file?novel=&path=` | 读图片本体（`path` 相对小说目录，校验越界与图片后缀） |
 
 请求体只需 `chapter`，其余可选：
 
@@ -124,6 +173,43 @@ LLM_SKILLS_BUDGET_CHARS=60000
 
 响应是 `chapters[]`，每章一份五类产出与独立元数据（`index` / `title` / `text_chars` / `latency_ms` / `llm_calls` / `agent_calls` / `stages` / `gate_issues` …），顶层另有 `chapter_count` 与各项 `total_*` 汇总。
 
+**生成进度流**：`/generate-novel/stream` 与 `/generate-novel` 请求体、响应内容完全相同，但用 SSE（`text/event-stream`）把阶段进度推给前端。事件按序：
+
+| 事件 | data | 说明 |
+| --- | --- | --- |
+| `progress` | `{"phase","text","step","total"}` | 若干条，只报阶段不报内容；`total=0` 为不确定态 |
+| `done` | 完整 `NovelPipelineResponse` | 一条，与老端点逐字一致（含 `archive`） |
+| `error` | `{"message"}` | 生成失败时一条，不直接断连 |
+
+实现要点（`app/generation/graph.py` + `app/api/pipeline.py`）：进度用 LangGraph 原生 `get_stream_writer()` 在图节点内发 `custom` 事件，编译图 `stream(stream_mode=["custom", "values"])` 同时收进度与最终 state；`values` 块不外发。归档阶段在路由层单独报一条。同步图用 starlette `iterate_in_threadpool` 在线程池跑，不阻塞事件循环（进度事件依赖 contextvar，跨线程实测不丢）。老端点走 `invoke`，同一份图节点下进度事件是 no-op，行为不变。阶段文案集中在 `graph.py` 的 `PROGRESS`。前端用 `fetch + ReadableStream` 自解析 SSE（`EventSource` 只支持 GET，POST 带正文不适用）。
+
+**资产归档**：`/generate-novel` 成功后由 `app/generation/archive.py` 自动落盘到 `assets/<小说名>/`（配置键 `LLM_ASSET_ROOT`），响应顶层多一个 `archive` 报告对象：
+
+| 字段 | 含义 |
+| --- | --- |
+| `root` / `novel_dir` | 归档根与本次小说目录（绝对路径字符串） |
+| `files_written` | 本次原子写入的 Markdown 文件数 |
+| `characters` / `props` / `scenes` | 跨章去重后的资产条目数 |
+| `image_prompt_entries` | 由资产事实模板拼出的 `IMG-...` 条目数（零 LLM 调用） |
+| `image_prompts_written` | 本次写到资产目录主文件的提示词文档数；资产事实为空而跳过的条目计入 `errors` |
+| `prompts_skipped` | 因 edited/approved 被跳过覆盖、改写对照副本的提示词数 |
+| `prompt_draft` / `prompt_edited` / `prompt_approved` | 归档后各状态提示词总数 |
+| `chapters` | 落了站位或分镜的章数 |
+| `errors` | 局部失败说明；非空表示部分落盘 |
+
+目录结构：`assets/<小说名>/{角色/<角色名>/, 场景/<场景名>/, 道具/<道具名>/, 章节/<章节名>/}`——四个固定中文分类目录，其下才是条目名目录，再往下才是文档。角色 / 场景 / 道具按 `name` 跨章合并、同名只落一份并列出出现章节；道具**一律**落 `道具/<道具名>/`，`owner` 只写进正文「归属角色」、不决定落盘位置（角色目录里只有角色自己的两份文档）；每章只落 `角色站位.md` 与 `分镜.md`（原文不落盘，台词逐字取自原文）。文件名经净化、撞名加序号，重跑幂等覆盖（临时文件 + `os.replace`）。归档失败只在 `archive.errors` 回告并记 WARNING，生成结果照常返回 200——归档是副作用，不是生成的前置闸门。
+
+**S3 图片提示词（零 LLM 拼装）**：`app/generation/image_prompts.py` 是纯函数层——取资产 `prompt`（S2 已把 appearance/stable_features/state 整合成外观事实），按技能包 `sheet-prompt-guide.md` 的六段顺序拼固定版式外壳，产出 `IMG-CHAR-...` / `IMG-SCENE-...` / `IMG-PROP-...` 条目，编号全局连续。与资产文档同目录落 `<名称>-图片提示词.md`，格式含 `- 用途：`、`- 参考：无外部参考` 与 `### 可复制提示词` 引用块。事实逐字取自资产描述，为空时按结构化字段回退、仍为空则跳过并回告 warning；边界：单状态、无外部参考、道具默认无可读字、连戏锁需人工复核，不生成图片、不绑定 `REF-...`。**`llm_calls` 不增加**——这一步不产生任何模型调用。
+
+**资产库：清单与三态**（`app/generation/asset_store.py` + `app/api/assets.py`）：每本小说目录下有 `_manifest.json`，存每条提示词的 `id / img_id / category / asset_name / path / status / body_hash / updated_at`——**正文只在 md 文件里，清单只做索引**，手工改文件仍生效。
+
+- **稳定 id**：`img-<category>-<sha1(category:asset_name) 前 8 位>`；`IMG-CHAR-001` 等只作展示标签，资产顺序变化不会让编辑挂错条目。
+- **三态**：`draft → edited → approved`。归档时无条目建 draft、draft 覆盖并刷新 hash、edited/approved 跳过主文件且模板 hash 变化时写 `<名称>-图片提示词.generated.md` 对照副本。`PUT` 保存置 edited，`POST .../approve` 只允许 edited → approved，`POST .../regenerate` 用对照副本覆盖主文件并回 draft。
+- **路径安全**：novel 名与 id 经净化 + `resolve()` 越界校验，id 必须命中清单条目，拒绝读 `<asset_root>` 外或清单未登记的文件；非法请求走全局 ValueError → 400 映射。
+- **边界**：编辑只动正文，不改 id / category / asset_name；不回填资产 `prompt`（资产是事实源，提示词是派生物）；不做编辑历史与多人锁。前端「资产库」Tab 调这些接口实现查看 / 筛选 / 编辑 / 定稿 / 采用模板版本。
+
+**章节不进清单**：章节没有 `IMG-...` 编号、没有三态，所以不写进 `_manifest.json`。`asset_store.list_chapters` 直接读 `章节/<章节标题>/` 目录，返回标题目录名 + 其下 `.md` 文档（名称 / 相对路径 / 字节数 / mtime）；`read_document` 读任意归档 Markdown 供只读查看，`path` 同样经 `resolve()` 校验必须落在小说目录内且只接受 `.md`。前端把章节与提示词拼成同一棵树展示，章节行标「只读」、不提供编辑与定稿。小说列表的 `chapters` 计数也按磁盘统计。
+
 **成本口径**：`llm_calls` 是生成调用（资产段 / 分镜段），`agent_calls` 是 agent 编排自己的调用（选工具 / 收尾）。真实调用下 auto 一章约 2 次生成 + 3 次编排；两者相加才是总调用数，只看 `llm_calls` 会低估。
 
 **切章不交给模型**：`app/generation/chapters.py` 用行首正则认「第X章/回/节/部/篇/集」，以及「序章/序幕/楔子/引子/终章/尾声/后记/番外」这类惯用节名；标题行允许带 `📖 `、`## ` 等非文字装饰前缀（粘贴场景常见），前缀随切片原样保留。只对源串做切片、不 strip 不归一化；切完做 `"".join(raw) == source` 逐字回拼，失败直接 400。正文里随口提到的「第三章的时候」不是独立标题行，不会被误切。上限 20 章、每章 20,000 字。同一份实现用 `@tool` 注册为 `split_chapters`，后续 agent 节点可直接复用。
@@ -149,6 +235,76 @@ flowchart LR
 **原文隔离**：章节原文在 `invoke` 时放进 state（`chapter_text`），工具通过 `ToolRuntime.state` 读取。两个工具的 schema 都是空的——模型无法把原文当参数复述或改写。原文确实进入了编排模型的上下文（agent 的固有代价），但它只能影响「调哪个工具」，不进入产物层。任何一章没有工具产出就抛错，绝不返回半成品。
 
 切章失败或任一章生成失败，图直接终止。单章 `/generate` 端点仍是原来的固定两段链，没走 agent，作为对照与兼容路径保留。
+
+## 出图通道（S7 设定图，`app/media/`）
+
+把 `图片提示词.md` 的 `### 可复制提示词` 正文变成真图。分四层，**业务层不认识任何厂商**：
+
+| 层 | 文件 | 职责 |
+| --- | --- | --- |
+| 端口层 | `contract.py` | `MediaProvider` 协议（`generate` / `collect`）、`MediaRequest` / `Capabilities` / `MediaResult`、`MediaError` 与错误分类、`sanitize_detail` |
+| 配置层 | `settings.py` | `MEDIA_*` 独立前缀；provider 名、模型名、地址都是字符串，默认值是离线实现 |
+| 任务层 | `jobs.py` | 指纹计算、确认码、`MediaJob` 状态机、`_media/` 落盘、日额度账本 |
+| 落盘层 | `store.py` | `图片/<条目>-vN.png` + `-vN.json` sidecar、版本号只增不减、`manifest.images[]` 回写 |
+| 服务层 | `service.py` | `preview` / `generate_stream` / `collect` 三个业务动作，串起上面四层 |
+| 厂商层 | `providers/` | `fixture`（离线假图，标准库画 PNG）/ `ark`（真实，OpenAI 兼容端点）+ `registry.py` |
+
+**为什么不用 LangChain 的模型抽象**：LangChain 1.x 的 `BaseChatModel` / `Embeddings` 只覆盖文本与向量，没有通用的图片模型接口。硬套只会把图片参数塞进 chat 消息里，反而失去类型检查。所以通道层只用 `openai` SDK 做 HTTP（连接池、超时、重试都是它的），外面包一层极薄的 provider 端口。
+
+**为什么没有 agent 层**：出图没有决策点——拿到提示词就调一次 provider，没有「先调 A 还是先调 B」的判断。套 `create_agent` 会白烧一次 LLM 调用，套 StateGraph 也只是把线性三步画成图，而确认码是**人**的动作、不是图的状态转移。批量编排与 `interrupt()` 留到多条目批量阶段。
+
+### 三步协议（对应技能包的 prepare / confirm / run）
+
+| 步 | 接口 | 花钱 | 做什么 |
+| --- | --- | --- | --- |
+| ① 预览 | `POST /api/media/preview` | 否 | 读提示词正文 → 算指纹 → 查缓存 → 查额度 → 回确认码与阻塞项 |
+| ② 确认 | 前端把确认码原样回传 | 否 | 用户看过指纹、成本、额度、水印警告后点确认 |
+| ③ 提交 | `POST /api/media/generate` | 是 | 重新校验指纹（防止预览后改过提示词）→ 核销确认码 → 调 provider → 落盘 |
+
+- **指纹**：`sha256(提示词正文 hash + provider + model + size + ratio + seed + 参考图 hash)`。改提示词、换模型、改画幅、换 seed 都会变。
+- **确认码**：`CONFIRM <job_id> <fingerprint[:12]>`。提交时服务端重算指纹比对，不一致就拒绝（`400`），强制重新预览。
+- **`submitted` 语义**：provider 明确告知「请求没发出去」（缺 key、缺模型、本地预检失败）→ `submitted=false`，**确认码保留**，修好配置可直接重试；请求已发出（含超时、限流）→ `submitted=true`，**确认码核销**，重试须重新确认——因为远端可能已经出图并计费。
+- **幂等**：同指纹已成功出图，`generate` 直接返回那张图（`cached: true`），一次都不提交。
+- **额度**：`MEDIA_DAILY_QUOTA` 只拦提交、不拦 `collect`（取回已有产物不该被额度卡）。
+
+### 失败语义与错误分类
+
+`MediaError.category` 固定八档（`contract.ErrorCategory`，闭集，不接受任意字符串）：
+`invalid_request` / `auth` / `rate_limit` / `quota` / `timeout` / `content_policy` / `network` / `provider_error`。
+
+`retryable` 由各 provider 按错误类型判定，不是按 category 机械映射：`rate_limit` / `timeout` / `network` 为真；
+另外 **HTTP 5xx 也判可重试**（`status >= 500`），4xx 与内容策略拒绝一律不可重试。
+
+`detail` 经 `sanitize_detail` 脱敏：抹掉 `sk-` / `Bearer` / `ark-` 形态的密钥、URL、绝对路径，截到 **400** 字
+（`MAX_DETAIL_CHARS`；留这么长是为了保住厂商报文末尾的处理指引，例如方舟 429 提示去管理页关闭安全体验模式）。
+**原始异常只进日志，不向前端透**。
+
+### 产物与版本
+
+```
+assets/<小说名>/<分类目录>/<条目名>/
+├── <条目名>-图片提示词.md      # 输入（逐字取 ### 可复制提示词 的引用块）
+└── 图片/
+    ├── <条目名>-v1.png          # 产物本体：事实源
+    ├── <条目名>-v1.json         # sidecar：指纹/模型/参数/seed/成本/耗时/源提示词 hash
+    ├── <条目名>-v2.png
+    └── <条目名>-v2.json
+```
+
+- **版本号只增不减**：`next_version` 取该条目已有最大版本 +1，永不复用。旧版留着能退，不静默清理。
+- **sidecar 是档案，不是事实源**：图没了 sidecar 无意义；手工换图不影响出图逻辑。
+- **`manifest.images[]`** 只是索引（id / 路径 / 版本 / 是否选用 / 指纹），清单丢了可从 `图片/` 目录重建。
+- **`_media/jobs/<job_id>.json`** 存任务状态（每本小说一套）。删掉只丢任务历史，不影响已出的图。
+- **额度账本 `assets/_media_ledger.json`** 在资产根、跨小说一份：日额度是「这台机器今天最多提交几次」的全局闸门，不按小说分账；保留最近 60 天。
+
+### 换厂商的验收口径
+
+```bash
+grep -rn "volcengine\|doubao\|seedream\|minimax" backend/app/ | grep -v "app/media/providers/"
+# 期望：零命中（配置别名 ARK_API_KEY 除外）
+```
+
+满足这条，就说明「换厂商只改 `.env` 的 `MEDIA_IMAGE_PROVIDER`」不是口号。新增厂商只需在 `providers/` 加一个文件、在 `registry.py` 注册，业务层零改动。
 
 ## 分层调用链
 
@@ -296,7 +452,7 @@ short-drama-storyboard: [storyboard, blocking]        # 第二段：站位 + 分
 设 `LLM_LOG_LEVEL=DEBUG`、`LLM_LOG_DIR=logs/`，跑几次请求后看 `logs/ai_skit.log`（JSON 行）：
 
 ```bash
-LLM_LOG_LEVEL=DEBUG LLM_LOG_DIR=logs uv run uvicorn app.main:app --port 8000
+LLM_LOG_LEVEL=DEBUG LLM_LOG_DIR=logs uv run uvicorn app.main:app --port 8001
 jq -c 'select(.record.extra.event=="llm_end") | .record.extra' logs/ai_skit.log
 ```
 
@@ -313,11 +469,12 @@ backend/
 ├── app/
 │   ├── main.py              # FastAPI 入口 + CORS + 挂载日志中间件 + 启动日志配置
 │   ├── api/                 # HTTP 接口层
-│   │   ├── pipeline.py      # skills、generate-novel、generate（+ extract-assets 别名）
+│   │   ├── pipeline.py      # skills、generate-novel（+ /stream SSE 进度）、generate（+ extract-assets 别名）
+│   │   ├── assets.py        # 资产库读写：列小说/提示词/读单条/保存/定稿/重渲染
 │   │   └── errors.py        # 异常 → 状态码的唯一映射（400 / 500）
 │   ├── core/                # 核心层：配置与数据契约
 │   │   ├── config.py        # 配置（provider / base_url / api_key / model / 调用参数 / 日志 / skills_*）
-│   │   └── schemas.py       # Pydantic 契约（五类产出 + Shot/StoryboardGroup + 机检函数）
+│   │   └── schemas.py       # Pydantic 契约（五类产出 + Shot/StoryboardGroup + 资产库清单 + 机检函数）
 │   ├── generation/          # 生成层：切章 → 规则 → 链 → 单章 → agent → 多章编排
 │   │   ├── prompts.py       # 两套 system 规则层（jinja2.Template）+ 输出契约
 │   │   ├── chains.py        # 模型工厂 + LCEL 链 + RunnableConfig + UsageCollector
@@ -325,7 +482,20 @@ backend/
 │   │   ├── mock_data.py     # 无密钥联调用的样例产物（不出现在生产路径）
 │   │   ├── chapters.py      # 多章切分：行首标题识别 / 逐字回拼 / @tool split_chapters
 │   │   ├── agent.py         # 章内 create_agent：两个工具 + 顺序闸门 + 脚本假模型 + 编排调用计数
-│   │   └── graph.py         # LangGraph：split → generate（按章回环，内部进 agent）→ finalize
+│   │   ├── graph.py         # LangGraph：split → generate（按章回环，内部进 agent）→ finalize；get_stream_writer 发进度；stream_novel_pipeline 流式入口
+│   │   ├── archive.py       # 资产归档：final → assets/<小说名>/ 目录树（Markdown、跨章去重、原子写、尊重三态）
+│   │   ├── image_prompts.py # S3 图片提示词：资产事实 + 固定版式模板 → IMG-...（纯函数、零 LLM）
+│   │   └── asset_store.py   # 资产库清单：_manifest.json 读写、稳定 id、三态迁移、路径安全
+│   ├── media/               # 出图层（S7 设定图）：端口 + provider + 任务层
+│   │   ├── contract.py      # MediaProvider 端口、请求/能力/结果契约、错误分类与脱敏
+│   │   ├── settings.py      # MEDIA_* 配置（独立前缀，不认识具体厂商）
+│   │   ├── jobs.py          # 指纹、确认码、任务状态机、日额度账本（_media/）
+│   │   ├── store.py         # 图片落盘：图片/<条目>-vN.png + sidecar + manifest.images[]
+│   │   ├── service.py       # preview / generate_stream / collect 三步协议
+│   │   └── providers/       # 唯一允许出现厂商名的地方
+│   │       ├── fixture.py   # 离线假图（标准库 zlib 画 PNG，零依赖）
+│   │       ├── ark_seedream.py # 真实：OpenAI 兼容端点 + 载荷编译 + 错误映射
+│   │       └── registry.py  # 按名字装配；allow_paid=false 时拒绝真实厂商
 │   ├── observability/       # 可观测层：分级日志、用量提取与请求中间件
 │   │   ├── logging.py       # loguru 分级日志 + run_id ContextVar + LoggingCallback（脱敏落盘）
 │   │   ├── usage.py         # token 用量提取（响应 stages 与日志共用一份规则）
@@ -348,7 +518,7 @@ backend/
 
 ```bash
 cd backend
-uv run python -m unittest discover -s tests   # 154 tests OK
+uv run python -m unittest discover -s tests   # 248 tests OK
 uv run ruff check app tests                   # All checks passed
 ```
 

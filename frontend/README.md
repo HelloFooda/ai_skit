@@ -9,5 +9,5 @@ Vue 3 + Vite + TypeScript 前端：输入小说章节 → 调后端 → 展示�
 
 ```bash
 npm install
-npm run dev        # http://localhost:5173，/api 代理到后端 8000
+npm run dev        # http://localhost:5174，/api 代理到后端 8001
 ```

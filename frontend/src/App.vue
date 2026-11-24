@@ -1,18 +1,41 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref } from "vue";
+import AssetLibrary from "./AssetLibrary.vue";
+import ChapterAssetDrawer from "./ChapterAssetDrawer.vue";
+import ResultView from "./ResultView.vue";
 import {
-  generateNovel,
+  generateNovelStream,
+  listAssetNovels,
   listSkills,
+  type NovelAssetSummary,
   type NovelExtractMode,
   type NovelGenerateResponse,
   type SkillInfo,
 } from "./api";
+import { theme, toggleTheme } from "./theme";
 
+const tab = ref<"generate" | "library">("generate");
 const novelTitle = ref("测试小说");
-const content = ref(
-  "第一章：雨夜来客\n林桂芳推开老饭馆的木门，铜钥匙在掌心攥得发烫。傍晚的暖黄顶灯下，沈砚舟正低头擦着一只旧怀表。\n\n" +
-    "第二章：铜钥匙\n沈砚舟抬起头：「你怎么来了。」林桂芳摊开手掌，铜钥匙在灯下发亮。",
-);
+const content = ref("");
+
+/** 已归档小说：小说名输入框的候选项，name 是磁盘目录名（归档用的就是它） */
+const novelOptions = ref<NovelAssetSummary[]>([]);
+const novelListNotice = ref("");
+
+async function loadNovelOptions(initial = false) {
+  try {
+    const list = await listAssetNovels();
+    // 最近更新的排前面，省得每次翻找
+    novelOptions.value = [...list].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    // 仅首次加载：默认名还是占位值时落到最近用过的一本；刷新候选时不覆盖用户输入
+    if (initial && novelOptions.value.length && novelTitle.value === "测试小说") {
+      novelTitle.value = novelOptions.value[0].name;
+    }
+    novelListNotice.value = "";
+  } catch (e: unknown) {
+    novelListNotice.value = e instanceof Error ? e.message : String(e);
+  }
+}
 
 // 高级设置：默认全部走默认口径，用户不用管
 const showAdvanced = ref(false);
@@ -23,17 +46,101 @@ const mode = ref<NovelExtractMode>("auto");
 const targetDuration = ref(15);
 const maxGroups = ref(6);
 
-// 技能：全量展示，不按阶段过滤。只有「显式声明了类别」的技能会被自动装载
-// （本项目用 backend/skill-bindings.yaml 声明，不改技能文件本身）。
 const skillOptions = ref<SkillInfo[]>([]);
 const selectedSkills = ref<string[]>([]);
 const skillNotice = ref("");
 
+type StepState = "run" | "done";
+interface Step {
+  text: string;
+  state: StepState;
+}
+/** 对话消息：text 普通消息；steps 进度步骤；result 一次生成结果 */
+interface Msg {
+  id: number;
+  role: "user" | "assistant";
+  kind: "text" | "steps" | "result";
+  text?: string;
+  meta?: string;
+  tone?: "error";
+  steps?: Step[];
+  result?: NovelGenerateResponse;
+  /** 生成当时的参数快照，避免改设置后回看旧结果时文案漂移 */
+  dur?: number;
+  maxG?: number;
+}
+
+let seq = 0;
+const messages = ref<Msg[]>([
+  {
+    id: ++seq,
+    role: "assistant",
+    kind: "text",
+    text:
+      "把小说名和章节原文发给我，我按「第X章」切分后逐章出五类描述（角色 / 道具 / 场景 / 站位 / 分镜）。\n" +
+      "原文直接贴进下面的输入框即可，标题要独占一行。",
+  },
+]);
+
 const loading = ref(false);
-const error = ref("");
-const novelResult = ref<NovelGenerateResponse | null>(null);
-const activeChapter = ref(0);
-const current = computed(() => novelResult.value?.chapters[activeChapter.value] ?? null);
+const abortController = ref<AbortController | null>(null);
+const threadEl = ref<HTMLElement | null>(null);
+
+// ---- 提问节点条 ----
+/** 每次用户提问就是一个节点；序号与消息绑定，不随消息增删漂移 */
+const questions = computed(() => messages.value.filter((m) => m.role === "user" && m.kind === "text"));
+const activeNodeId = ref<number | null>(null);
+const railCollapsed = ref(false);
+
+const msgDomId = (id: number) => `msg-${id}`;
+
+/** 节点标题取原文第一个非空行（通常是「第X章」标题），过长截断 */
+function nodeLabel(m: Msg): string {
+  const first = (m.text ?? "").split("\n").map((s) => s.trim()).find(Boolean) ?? "未命名提问";
+  return first.length > 15 ? `${first.slice(0, 15)}…` : first;
+}
+
+function nodeNovel(m: Msg): string {
+  return m.meta?.split(" · ")[0] ?? "";
+}
+
+/** 滚动时找出最后一个已经越过容器顶部的提问节点，作为当前所在节点 */
+function onThreadScroll() {
+  const el = threadEl.value;
+  if (!el || !questions.value.length) return;
+  const top = el.getBoundingClientRect().top;
+  let current = questions.value[0].id;
+  for (const q of questions.value) {
+    const node = document.getElementById(msgDomId(q.id));
+    if (node && node.getBoundingClientRect().top - top <= 90) current = q.id;
+  }
+  activeNodeId.value = current;
+}
+
+function scrollToNode(id: number) {
+  activeNodeId.value = id;
+  document.getElementById(msgDomId(id))?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+/** 对话页资产抽屉：记录是哪条生成结果打开的，以及停在哪一章 */
+const assetDrawerMsgId = ref<number | null>(null);
+const assetDrawerChapter = ref(0);
+const assetDrawerMsg = computed(() => messages.value.find((m) => m.id === assetDrawerMsgId.value) ?? null);
+const assetDrawerResult = computed(() => assetDrawerMsg.value?.result ?? null);
+
+function openAssetDrawer(msg: Msg, chapterIndex: number) {
+  assetDrawerMsgId.value = msg.id;
+  assetDrawerChapter.value = chapterIndex;
+}
+
+function closeAssetDrawer() {
+  assetDrawerMsgId.value = null;
+}
+
+function assetDrawerToLibrary() {
+  closeAssetDrawer();
+  switchToLibrary();
+}
 
 const CATEGORY_LABELS: Record<string, string> = {
   characters: "角色",
@@ -53,16 +160,14 @@ function categoryText(categories: string[]): string {
   return real.length ? real.map((c) => CATEGORY_LABELS[c] || c).join("/") : "未声明类别";
 }
 
-const autoLoadable = computed(() =>
-  skillOptions.value.filter((s) => s.categories.some((c) => c !== "manual")),
-);
-
-/** 分镜总时长（按组时长之和，用来核对是否超出一章容量） */
-const totalSeconds = computed(() =>
-  (current.value?.storyboards ?? []).reduce((sum, g) => sum + g.duration, 0),
+const autoLoadable = computed(
+  () => skillOptions.value.filter((s) => s.categories.some((c) => c !== "manual")).length,
 );
 
 onMounted(async () => {
+  // 窄屏默认收起节点条，展开时作为浮层覆盖，不挤压对话正文
+  railCollapsed.value = window.innerWidth < 1320;
+  void loadNovelOptions(true);
   try {
     const res = await listSkills();
     skillOptions.value = [...res.skills].sort((a, b) => {
@@ -76,468 +181,898 @@ onMounted(async () => {
   } catch (e: unknown) {
     skillNotice.value = e instanceof Error ? e.message : String(e);
   }
+  scrollToBottom();
+  onThreadScroll();
 });
 
-async function run() {
-  loading.value = true;
-  error.value = "";
-  novelResult.value = null;
-  activeChapter.value = 0;
-  try {
-    novelResult.value = await generateNovel({
-      novel_title: novelTitle.value,
-      content: content.value,
-      character_hint: characterHint.value,
-      prop_hint: propHint.value,
-      scene_hint: sceneHint.value,
-      mode: mode.value,
-      target_duration: targetDuration.value,
-      max_groups: maxGroups.value,
-      skills: selectedSkills.value,
-    });
-  } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    loading.value = false;
+async function scrollToBottom() {
+  await nextTick();
+  const el = threadEl.value;
+  if (el) el.scrollTop = el.scrollHeight;
+}
+
+function push(msg: Omit<Msg, "id">): Msg {
+  messages.value.push({ ...msg, id: ++seq });
+  scrollToBottom();
+  // 必须从 ref 里取回代理对象再改内部数组，直接改原始对象不会触发视图更新
+  return messages.value[messages.value.length - 1];
+}
+
+/** 进度事件 → 步骤列表：上一步收尾打勾，新一步接着转 */
+function advance(steps: Step[], text: string) {
+  if (!text) return;
+  const last = steps[steps.length - 1];
+  if (last && last.text === text) return;
+  if (last) last.state = "done";
+  steps.push({ text, state: "run" });
+  // 长篇小说步骤会很多，只留最近若干条，避免把结果挤出视口
+  while (steps.length > 14) steps.shift();
+  scrollToBottom();
+}
+
+function onKeydown(e: KeyboardEvent) {
+  // 正文是多行原文，回车用于换行；发送走 Cmd/Ctrl + Enter
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    send();
   }
 }
 
-const copied = ref("");
-async function copy(text: string, key: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    copied.value = key;
-    setTimeout(() => {
-      if (copied.value === key) copied.value = "";
-    }, 1200);
-  } catch {
-    copied.value = "";
+async function send() {
+  if (loading.value) return;
+  const raw = content.value.trim();
+  const title = novelTitle.value.trim() || "未命名小说";
+  if (!raw) {
+    push({ role: "assistant", kind: "text", tone: "error", text: "还没收到正文，把章节原文贴进来再发。" });
+    return;
   }
+
+  push({
+    role: "user",
+    kind: "text",
+    text: raw,
+    meta: `《${title}》 · ${raw.length} 字`,
+  });
+  content.value = "";
+
+  const stepMsg = push({ role: "assistant", kind: "steps", steps: [] });
+  const steps = stepMsg.steps!;
+  loading.value = true;
+  const controller = new AbortController();
+  abortController.value = controller;
+  let finished = false;
+
+  try {
+    await generateNovelStream(
+      {
+        novel_title: title,
+        content: raw,
+        character_hint: characterHint.value,
+        prop_hint: propHint.value,
+        scene_hint: sceneHint.value,
+        mode: mode.value,
+        target_duration: targetDuration.value,
+        max_groups: maxGroups.value,
+        skills: selectedSkills.value,
+      },
+      {
+        signal: controller.signal,
+        onProgress: (event) => advance(steps, event.text),
+        onDone: (result) => {
+          finished = true;
+          steps.forEach((s) => (s.state = "done"));
+          // 新小说归档后刷新候选，下次直接从下拉里选，不用再手打
+          void loadNovelOptions();
+          push({
+            role: "assistant",
+            kind: "result",
+            result,
+            dur: targetDuration.value,
+            maxG: maxGroups.value,
+          });
+        },
+        onError: (message) => {
+          finished = true;
+          steps.forEach((s) => (s.state = "done"));
+          push({ role: "assistant", kind: "text", tone: "error", text: `生成失败：${message}` });
+        },
+      },
+    );
+  } catch (e: unknown) {
+    steps.forEach((s) => (s.state = "done"));
+    if (e instanceof DOMException && e.name === "AbortError") {
+      push({ role: "assistant", kind: "text", text: "已停止生成。" });
+    } else {
+      const message = e instanceof Error ? e.message : String(e);
+      push({ role: "assistant", kind: "text", tone: "error", text: `请求失败：${message}` });
+    }
+  } finally {
+    if (!finished) steps.forEach((s) => (s.state = "done"));
+    loading.value = false;
+    abortController.value = null;
+    scrollToBottom();
+  }
+}
+
+function cancelRun() {
+  abortController.value?.abort();
+}
+
+function switchToLibrary() {
+  tab.value = "library";
+}
+
+function goGenerate() {
+  tab.value = "generate";
+  scrollToBottom();
 }
 </script>
 
 <template>
-  <main class="wrap">
-    <h1>贴一部小说的若干章，按章出五类描述</h1>
-    <p class="lead">
-      小说名独立填写，标题与正文贴同一个框。按「第X章」标题行确定性切分并逐字回拼，
-      通过后才交给 LangGraph 逐章生成：每章先盘资产，再带资产表写站位与
-      {{ targetDuration }}s 分镜组表。
-    </p>
-
-    <label class="field-label" for="novel-title">小说名</label>
-    <input
-      id="novel-title"
-      class="title-input"
-      v-model="novelTitle"
-      placeholder="逐字保留，供后续资产归档使用"
-    />
-
-    <label class="field-label" for="content">章节原文（标题 + 正文，可多章）</label>
-    <textarea
-      id="content"
-      v-model="content"
-      rows="10"
-      placeholder="第一章：标题&#10;正文……&#10;&#10;第二章：标题&#10;正文……"
-    ></textarea>
-    <p class="muted small hint-line">
-      标题必须独占一行且以「第X章」开头（章/回/节/部/篇/集均可）；正文里随口提到的章号不会被误切。
-    </p>
-
-    <div class="actions">
-      <button :disabled="loading" @click="run">
-        {{ loading ? "生成中…" : "按章生成五类描述" }}
-      </button>
-      <span class="muted small">
-        每章 2 次模型调用：盘资产 → 写站位与分镜。只想要资产可切「仅资产」，省一半。
-      </span>
-    </div>
-
-    <details class="advanced" :open="showAdvanced" @toggle="showAdvanced = !showAdvanced">
-      <summary>高级设置（选填，不填就走默认口径）</summary>
-
-      <p class="sub-title">
-        分类补充提示词
-        <span class="muted">（各自只作用于本类别，不会串到别的类别上）</span>
-      </p>
-      <div class="hint-grid">
-        <div>
-          <label class="field-label" for="character-hint">角色</label>
-          <textarea
-            id="character-hint"
-            v-model="characterHint"
-            rows="2"
-            placeholder="例：重点写可跨分镜复用的稳定视觉特征"
-          ></textarea>
-        </div>
-        <div>
-          <label class="field-label" for="prop-hint">角色道具</label>
-          <textarea
-            id="prop-hint"
-            v-model="propHint"
-            rows="2"
-            placeholder="例：只登记后文还会再次出现的道具"
-          ></textarea>
-        </div>
-        <div>
-          <label class="field-label" for="scene-hint">场景</label>
-          <textarea
-            id="scene-hint"
-            v-model="sceneHint"
-            rows="2"
-            placeholder="例：光线写具体光源与方向"
-          ></textarea>
-        </div>
+  <main class="wrap" :class="{ 'library-mode': tab === 'library' }">
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <b>剧集生成</b>
+        <span class="muted small">小说 → 五类描述 → 资产归档</span>
       </div>
-
-      <div class="mode-row">
-        <span class="field-label">调用方式</span>
-        <label>
-          <input type="radio" value="auto" v-model="mode" />
-          出全五类 <span class="muted">（两段生成 + agent 编排，默认）</span>
-        </label>
-        <label>
-          <input type="radio" value="assets_only" v-model="mode" />
-          仅资产 <span class="muted">（一段生成，返修资产时用）</span>
-        </label>
-        <label>
-          <input type="radio" value="per_type" v-model="mode" />
-          三类分开 <span class="muted">（3 次并发，对照用）</span>
-        </label>
-      </div>
-
-      <div class="mode-row">
-        <span class="field-label">分镜</span>
-        <label>
-          单组目标
-          <input class="num" type="number" min="4" max="16" v-model.number="targetDuration" />
-          秒
-        </label>
-        <label>
-          本次最多
-          <input class="num" type="number" min="1" max="20" v-model.number="maxGroups" />
-          组
-        </label>
-        <span class="muted small">一章常常不止一组，超出上限只出前 N 组并标注</span>
-      </div>
-
-      <p class="sub-title">
-        技能规范
-        <span class="muted">
-          （不勾选 = 只自动装「声明过类别」的 {{ autoLoadable.length }} 个）
-        </span>
-      </p>
-      <div class="skill-list">
-        <label
-          v-for="s in skillOptions"
-          :key="s.name"
-          class="skill-item"
-          :class="{ 'skill-manual': !s.categories.some((c) => c !== 'manual') }"
-          :title="s.description"
-        >
-          <input type="checkbox" :value="s.name" v-model="selectedSkills" />
-          <span class="skill-name">{{ s.name }}</span>
-          <span class="skill-tag">{{ categoryText(s.categories) }}</span>
-          <span v-if="s.refs.length" class="skill-refs">{{ s.refs.length }} 篇细则</span>
-        </label>
-        <span v-if="!skillOptions.length" class="muted small">技能库为空或加载中…</span>
-      </div>
-      <p v-if="skillNotice" class="warn">{{ skillNotice }}</p>
-    </details>
-
-    <p v-if="error" class="err">{{ error }}</p>
-
-    <section v-if="novelResult && current" class="result">
-      <p class="meta">
-        《{{ novelResult.novel_title }}》共 {{ novelResult.chapter_count }} 章 ·
-        {{ novelResult.total_llm_calls }} 次生成 +
-        {{ novelResult.total_agent_calls }} 次编排 · 合计 {{ novelResult.total_latency_ms }}ms ·
-        机检 {{ novelResult.gate_issue_count }} 项
-      </p>
-      <div class="chapter-tabs">
-        <button
-          v-for="ch in novelResult.chapters"
-          :key="ch.index"
-          class="tab"
-          :class="{ active: ch.index === current.index }"
-          @click="activeChapter = ch.index - 1"
-        >
-          {{ ch.index }}. {{ ch.title }}
+      <nav class="tabs">
+        <button class="top-tab" :class="{ active: tab === 'generate' }" @click="goGenerate">
+          对话
         </button>
+        <button class="top-tab" :class="{ active: tab === 'library' }" @click="switchToLibrary">
+          资产库
+        </button>
+      </nav>
+      <button
+        class="theme-toggle"
+        :title="theme === 'dark' ? '切换到浅色' : '切换到深色'"
+        :aria-label="theme === 'dark' ? '切换到浅色' : '切换到深色'"
+        @click="toggleTheme"
+      >
+        <svg v-if="theme === 'dark'" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.4 5.4 0 0 1-4.4 2.26 5.4 5.4 0 0 1-5.4-5.4c0-1.9.98-3.57 2.46-4.54A9 9 0 0 0 12 3Z"
+          />
+        </svg>
+        <svg v-else viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2" fill="currentColor" />
+          <path
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            d="M12 2v2.6M12 19.4V22M4.9 4.9l1.9 1.9M17.2 17.2l1.9 1.9M2 12h2.6M19.4 12H22M4.9 19.1l1.9-1.9M17.2 6.8l1.9-1.9"
+          />
+        </svg>
+      </button>
+    </header>
+
+    <template v-if="tab === 'generate'">
+      <div ref="threadEl" class="thread" @scroll.passive="onThreadScroll">
+        <div v-for="m in messages" :id="msgDomId(m.id)" :key="m.id" class="msg" :class="m.role">
+          <div v-if="m.role === 'assistant'" class="avatar" aria-hidden="true">AI</div>
+          <div class="bubble">
+            <template v-if="m.kind === 'text'">
+              <p class="msg-text" :class="{ err: m.tone === 'error' }">{{ m.text }}</p>
+              <p v-if="m.meta" class="msg-meta">{{ m.meta }}</p>
+            </template>
+
+            <ul v-else-if="m.kind === 'steps'" class="steps">
+              <li v-for="(s, i) in m.steps" :key="i" :class="s.state">
+                <span class="step-icon" aria-hidden="true"></span>
+                <span>{{ s.text }}</span>
+              </li>
+            </ul>
+
+            <ResultView
+              v-else-if="m.kind === 'result' && m.result"
+              :result="m.result"
+              :target-duration="m.dur ?? targetDuration"
+              :max-groups="m.maxG ?? maxGroups"
+              @open-library="switchToLibrary"
+              @open-assets="openAssetDrawer(m, $event)"
+            />
+          </div>
+        </div>
       </div>
-      <p class="meta">
-        《{{ current.title }}》原文 {{ current.text_chars }} 字 · {{ current.latency_ms }}ms ·
-        提示词 {{ current.prompt_version }} · 生成 {{ current.llm_calls }} 次 +
-        编排 {{ current.agent_calls }} 次 ·
-        技能 {{ current.skills_loaded.join("、") || "未装载" }} ·
-        run_id {{ novelResult.run_id }} · {{ novelResult.model }} ·
-        {{ novelResult.mock ? "mock（未配密钥）" : "真实调用" }}
-        <template v-if="current.skills_refs_expanded">
-          （展开 {{ current.skills_refs_expanded }} 篇细则<template v-if="current.skills_refs_skipped"
-            >，{{ current.skills_refs_skipped }} 篇超预算</template
-          >）
+
+      <!-- 提问节点条：抽屉打开时让位，避免与抽屉重叠 -->
+      <aside v-if="!assetDrawerResult" class="node-rail" :class="{ collapsed: railCollapsed }">
+        <button
+          v-if="railCollapsed"
+          class="rail-peek"
+          title="展开提问节点"
+          @click="railCollapsed = false"
+        >
+          节点 <span v-if="questions.length">{{ questions.length }}</span>
+        </button>
+        <template v-else>
+          <div class="rail-head">
+            <span>提问节点 <small>{{ questions.length }}</small></span>
+            <button class="rail-close" title="收起节点条" @click="railCollapsed = true">×</button>
+          </div>
+          <div class="rail-list">
+            <p v-if="!questions.length" class="rail-empty">发送章节原文后，这里会出现提问节点</p>
+            <button
+              v-for="(q, i) in questions"
+              :key="q.id"
+              class="rail-node"
+              :class="{ active: activeNodeId === q.id }"
+              :title="q.text"
+              @click="scrollToNode(q.id)"
+            >
+              <span class="rail-dot" aria-hidden="true"></span>
+              <span class="rail-body">
+                <b>{{ i + 1 }}. {{ nodeLabel(q) }}</b>
+                <small v-if="nodeNovel(q)">{{ nodeNovel(q) }}</small>
+              </span>
+            </button>
+          </div>
+          <div class="rail-foot">
+            <button @click="scrollToBottom">回到最新 ↓</button>
+          </div>
         </template>
-      </p>
+      </aside>
 
-      <p v-if="current.injection_warning" class="warn">
-        章节里检测到疑似指令式语句。已按「素材而非指令」处理，原文一字未改。
-      </p>
-      <p v-if="current.skills_skipped.length" class="warn">
-        因篇幅预算未装载：{{ current.skills_skipped.join("、") }}
-      </p>
-      <p v-if="current.truncated" class="warn">
-        本章预估需 {{ current.total_groups_estimated }} 组，本次只出前
-        {{ current.storyboards.length }} 组（上限 {{ maxGroups }}）。调高「本次最多组数」或分段贴原文。
-      </p>
-      <p v-if="current.gate_issues.length" class="warn">
-        机检提示 {{ current.gate_issues.length }} 项（不阻断，S5 正式门禁会拦）：
-        {{ current.gate_issues.map((i) => `${i.group_id} ${i.detail}`).join("；") }}
-      </p>
-
-      <!-- 1 角色 -->
-      <h2 class="block-title">① 角色 <span class="count">{{ current.characters.length }}</span></h2>
-      <div class="cards">
-        <article v-for="c in current.characters" :key="c.name" class="card">
-          <header>
-            <b>{{ c.name }}</b>
-          </header>
-          <p>{{ c.appearance }}</p>
-          <p class="kv"><span>稳定特征</span>{{ c.stable_features }}</p>
-          <p v-if="c.state" class="kv"><span>本集状态</span>{{ c.state }}</p>
-          <p v-if="c.voice" class="kv"><span>声线</span>{{ c.voice }}</p>
-          <div v-if="c.prompt" class="prompt">
-            <div class="prompt-head">
-              <span>资产描述</span>
-              <button class="copy" @click="copy(c.prompt, 'c-' + c.name)">
-                {{ copied === "c-" + c.name ? "已复制" : "复制" }}
-              </button>
+      <div class="composer">
+        <div v-if="showAdvanced" class="composer-panel">
+          <p class="sub-title">
+            分类补充提示词
+            <span class="muted">（各自只作用于本类别，不会串到别的类别上）</span>
+          </p>
+          <div class="hint-grid">
+            <div>
+              <label class="field-label" for="character-hint">角色</label>
+              <textarea
+                id="character-hint"
+                v-model="characterHint"
+                rows="2"
+                placeholder="例：重点写可跨分镜复用的稳定视觉特征"
+              ></textarea>
             </div>
-            <p>{{ c.prompt }}</p>
-          </div>
-        </article>
-      </div>
-
-      <!-- 2 角色道具 -->
-      <h2 class="block-title">② 角色道具 <span class="count">{{ current.props.length }}</span></h2>
-      <div class="cards">
-        <article v-for="p in current.props" :key="p.name" class="card">
-          <header>
-            <b>{{ p.name }}</b>
-            <span v-if="p.owner" class="badge">归属 {{ p.owner }}</span>
-            <span v-else class="badge gray">环境陈设</span>
-          </header>
-          <p>{{ p.appearance }}</p>
-          <p v-if="p.state_changes" class="kv"><span>状态变化</span>{{ p.state_changes }}</p>
-          <div v-if="p.prompt" class="prompt">
-            <div class="prompt-head">
-              <span>资产描述</span>
-              <button class="copy" @click="copy(p.prompt, 'p-' + p.name)">
-                {{ copied === "p-" + p.name ? "已复制" : "复制" }}
-              </button>
+            <div>
+              <label class="field-label" for="prop-hint">角色道具</label>
+              <textarea
+                id="prop-hint"
+                v-model="propHint"
+                rows="2"
+                placeholder="例：只登记后文还会再次出现的道具"
+              ></textarea>
             </div>
-            <p>{{ p.prompt }}</p>
-          </div>
-        </article>
-      </div>
-
-      <!-- 3 场景 -->
-      <h2 class="block-title">③ 场景 <span class="count">{{ current.scenes.length }}</span></h2>
-      <div class="cards">
-        <article v-for="s in current.scenes" :key="s.name" class="card">
-          <header>
-            <b>{{ s.name }}</b>
-            <span class="badge gray">{{ s.time }}</span>
-          </header>
-          <p class="kv"><span>光线</span>{{ s.light }}</p>
-          <p class="kv"><span>氛围</span>{{ s.atmosphere }}</p>
-          <div v-if="s.prompt" class="prompt">
-            <div class="prompt-head">
-              <span>资产描述</span>
-              <button class="copy" @click="copy(s.prompt, 's-' + s.name)">
-                {{ copied === "s-" + s.name ? "已复制" : "复制" }}
-              </button>
+            <div>
+              <label class="field-label" for="scene-hint">场景</label>
+              <textarea
+                id="scene-hint"
+                v-model="sceneHint"
+                rows="2"
+                placeholder="例：光线写具体光源与方向"
+              ></textarea>
             </div>
-            <p>{{ s.prompt }}</p>
           </div>
-        </article>
-      </div>
 
-      <!-- 4 角色站位 -->
-      <template v-if="current.blockings.length">
-        <h2 class="block-title">
-          ④ 角色站位 <span class="count">{{ current.blockings.length }} 组</span>
-        </h2>
-        <p class="note">从分镜表第十列聚合，不单独生成，所以永远和分镜一致。</p>
-        <div class="groups">
-          <article v-for="b in current.blockings" :key="b.group_id" class="group">
-            <header class="group-head">
-              <b>{{ b.group_id }}</b>
-              <span class="muted">{{ b.location }}</span>
-            </header>
-            <pre class="blocking">{{ b.text }}</pre>
-          </article>
+          <div class="mode-row">
+            <span class="field-label">调用方式</span>
+            <label>
+              <input type="radio" value="auto" v-model="mode" />
+              出全五类 <span class="muted">（两段生成 + 编排）</span>
+            </label>
+            <label>
+              <input type="radio" value="assets_only" v-model="mode" />
+              仅资产 <span class="muted">（返修资产时用）</span>
+            </label>
+            <label>
+              <input type="radio" value="per_type" v-model="mode" />
+              三类分开 <span class="muted">（对照用）</span>
+            </label>
+          </div>
+
+          <div class="mode-row">
+            <span class="field-label">分镜</span>
+            <label>
+              单组目标
+              <input class="num" type="number" min="4" max="16" v-model.number="targetDuration" />
+              秒
+            </label>
+            <label>
+              本次最多
+              <input class="num" type="number" min="1" max="20" v-model.number="maxGroups" />
+              组
+            </label>
+            <span class="muted small">一章常常不止一组，超出上限只出前 N 组并标注</span>
+          </div>
+
+          <p class="sub-title">
+            技能规范
+            <span class="muted">
+              （不勾选 = 只自动装「声明过类别」的 {{ autoLoadable }} 个）
+            </span>
+          </p>
+          <div class="skill-list">
+            <label
+              v-for="s in skillOptions"
+              :key="s.name"
+              class="skill-item"
+              :class="{ 'skill-manual': !s.categories.some((c) => c !== 'manual') }"
+              :title="s.description"
+            >
+              <input type="checkbox" :value="s.name" v-model="selectedSkills" />
+              <span class="skill-name">{{ s.name }}</span>
+              <span class="skill-tag">{{ categoryText(s.categories) }}</span>
+              <span v-if="s.refs.length" class="skill-refs">{{ s.refs.length }} 篇细则</span>
+            </label>
+            <span v-if="!skillOptions.length" class="muted small">技能库为空或加载中…</span>
+          </div>
+          <p v-if="skillNotice" class="warn">{{ skillNotice }}</p>
         </div>
-      </template>
 
-      <!-- 5 15s 分镜 -->
-      <template v-if="current.storyboards.length">
-        <h2 class="block-title">
-          ⑤ {{ targetDuration }}s 分镜
-          <span class="count">
-            {{ current.storyboards.length }} 组 / 共 {{ Math.round(totalSeconds) }}s
-          </span>
-        </h2>
-        <p class="note">组时长 = 各镜之和；单镜 ≥1.2s；固定机位写「机位固定」；台词逐字取自原文。</p>
-        <div class="groups">
-          <article v-for="g in current.storyboards" :key="g.group_id" class="group">
-            <header class="group-head">
-              <b>{{ g.group_id }}</b>
-              <span class="badge">{{ g.duration }}s</span>
-              <span class="muted">{{ g.location }}</span>
-              <span v-if="g.summary" class="muted">· {{ g.summary }}</span>
-            </header>
-            <div v-for="sh in g.shots" :key="sh.shot_no" class="shot">
-              <div class="shot-head">
-                <span class="shot-no">{{ sh.shot_no }}</span>
-                <span class="badge gray">{{ sh.duration }}s</span>
-                <span class="tag">{{ sh.shot_size }}</span>
-                <span class="tag">{{ sh.angle }}</span>
-                <span class="tag">{{ sh.camera }}</span>
-                <span class="tag func">{{ sh.function }}</span>
-              </div>
-              <p class="shot-body">{{ sh.content }}</p>
-              <p v-if="sh.dialogue" class="dialogue">「{{ sh.dialogue }}」</p>
-              <p class="blocking-line">{{ sh.blocking }}</p>
-            </div>
-          </article>
+        <div class="composer-box">
+          <div class="title-row">
+            <span class="title-label">小说名</span>
+            <input
+              v-model="novelTitle"
+              class="title-input"
+              list="novel-options"
+              placeholder="输入新小说名，或从已归档小说里选"
+            />
+            <datalist id="novel-options">
+              <option
+                v-for="n in novelOptions"
+                :key="n.name"
+                :value="n.name"
+                :label="`${n.title} · ${n.entries} 项资产`"
+              ></option>
+            </datalist>
+            <span v-if="novelListNotice" class="muted small" :title="novelListNotice">候选加载失败</span>
+            <span v-else-if="novelOptions.length" class="muted small">{{ novelOptions.length }} 本已归档</span>
+          </div>
+          <textarea
+            v-model="content"
+            class="composer-input"
+            rows="3"
+            placeholder="把章节原文贴在这里……&#10;第一章：雨夜来客&#10;正文……"
+            @keydown="onKeydown"
+          ></textarea>
+          <div class="composer-actions">
+            <button class="gear" @click="showAdvanced = !showAdvanced">
+              {{ showAdvanced ? "收起设置" : "高级设置" }}
+            </button>
+            <span class="muted small">
+              ⌘/Ctrl + Enter 发送 · 标题以「第X章」开头且独占一行
+            </span>
+            <span class="spacer"></span>
+            <button v-if="loading" class="cancel" @click="cancelRun">停止</button>
+            <button class="send" :disabled="loading || !content.trim()" @click="send">
+              {{ loading ? "生成中…" : "发送" }}
+            </button>
+          </div>
         </div>
-      </template>
-    </section>
+      </div>
+    </template>
+
+    <AssetLibrary v-else :prefer-novel="novelTitle" />
   </main>
+
+  <ChapterAssetDrawer
+    v-if="assetDrawerResult"
+    :open="true"
+    :novel="assetDrawerResult.novel_title || novelTitle"
+    :result="assetDrawerResult"
+    :chapter-index="assetDrawerChapter"
+    @update:chapter-index="assetDrawerChapter = $event"
+    @close="closeAssetDrawer"
+    @open-library="assetDrawerToLibrary"
+  />
 </template>
 
 <style scoped>
 .wrap {
-  max-width: 1040px;
+  max-width: 980px;
+  height: 100vh;
   margin: 0 auto;
-  padding: 28px 24px 60px;
+  padding: 0 20px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
   font-family: system-ui, -apple-system, sans-serif;
-  color: #1d1d1f;
+  color: var(--fg);
+  background: var(--bg);
 }
-h1 {
-  font-size: 21px;
-  margin: 0 0 6px;
+/* 资产库页面按普通文档流滚动，不受对话页的整屏高度约束 */
+.wrap.library-mode {
+  height: auto;
+  min-height: 100vh;
+  display: block;
+  padding-bottom: 48px;
 }
-.lead {
-  color: #777;
+.topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  padding: 5px 0 0;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  padding-bottom: 8px;
+}
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.tabs {
+  display: flex;
+  gap: 4px;
+}
+.top-tab {
+  padding: 8px 16px;
+  font-size: 13.5px;
+  background: transparent;
+  color: var(--fg-secondary);
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  cursor: pointer;
+}
+.top-tab.active {
+  color: var(--accent);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+.theme-toggle {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 6px;
+  background: var(--bg-subtle);
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  cursor: pointer;
+}
+.theme-toggle:hover {
+  border-color: var(--accent-border);
+  background: var(--bg-hover);
+}
+
+/* ---- 对话区 ---- */
+.thread {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 22px 2px 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  scroll-behavior: smooth;
+}
+.msg {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  scroll-margin-top: 10px;
+}
+.msg.user {
+  justify-content: flex-end;
+}
+.avatar {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+.bubble {
+  min-width: 0;
+  max-width: 100%;
+  flex: 1;
+}
+.msg.user .bubble {
+  flex: none;
+  max-width: 74%;
+  background: var(--user-bubble);
+  border-radius: 14px 14px 4px 14px;
+  padding: 10px 14px;
+}
+.msg-text {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.78;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg);
+}
+.msg.user .msg-text {
+  max-height: 168px;
+  overflow-y: auto;
+  font-size: 13.5px;
+  color: var(--fg-secondary);
+}
+.msg-text.err {
+  color: var(--danger);
+}
+.msg-meta {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+/* 进度：像助手在一步步报工，不做进度条 */
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--fg-muted);
+}
+.steps li.run {
+  color: var(--accent);
+}
+.step-icon {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  margin-top: 3px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+  position: relative;
+}
+.steps li.run .step-icon {
+  border-color: var(--accent-border);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+.steps li.done .step-icon {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.steps li.done .step-icon::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 0.5px;
+  width: 4px;
+  height: 7px;
+  border: solid var(--accent-contrast);
+  border-width: 0 1.6px 1.6px 0;
+  transform: rotate(42deg);
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---- 提问节点条 ---- */
+.node-rail {
+  position: fixed;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 5;
+  width: 172px;
+  max-height: calc(100vh - 150px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-subtle);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.node-rail.collapsed {
+  width: auto;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+.rail-peek {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  color: var(--accent);
+  font-size: 12px;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+.rail-peek span {
+  margin-left: 3px;
+  color: var(--fg-muted);
+}
+.rail-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px 7px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-secondary);
+}
+.rail-head small {
+  color: var(--fg-muted);
+  font-weight: 400;
+}
+.rail-close {
+  width: 20px;
+  height: 20px;
+  line-height: 1;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 16px;
+  cursor: pointer;
+}
+.rail-close:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.rail-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 7px 6px;
+}
+.rail-empty {
+  margin: 6px 4px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--fg-muted);
+}
+.rail-node {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 7px 7px 9px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg-secondary);
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.rail-node:hover {
+  background: var(--bg-hover);
+}
+.rail-node.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.rail-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+  background: var(--bg-subtle);
+}
+.rail-node.active .rail-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.rail-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.rail-body b {
+  font-weight: 500;
+  word-break: break-all;
+}
+.rail-body small {
+  font-size: 10.5px;
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rail-foot {
+  flex: none;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--border);
+}
+.rail-foot button {
+  width: 100%;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.rail-foot button:hover {
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+/* ---- 输入区 ---- */
+.composer {
+  flex: none;
+  padding: 0 0 18px;
+  background: var(--bg);
+}
+.composer-box {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px 8px;
+  background: var(--bg);
+  box-shadow: var(--shadow);
+  transition: border-color 0.15s ease;
+}
+.composer-box:focus-within {
+  border-color: var(--accent-border);
+}
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--border);
+}
+.title-label {
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  flex: none;
+}
+.title-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
   font-size: 13px;
-  line-height: 1.7;
-  margin: 0 0 18px;
+  font-family: inherit;
+  color: var(--fg-secondary);
+  padding: 2px 0;
+}
+.composer-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  outline: none;
+  resize: none;
+  max-height: 30vh;
+  overflow-y: auto;
+  padding: 9px 0 4px;
+  font-size: 14px;
+  line-height: 1.75;
+  font-family: inherit;
+  color: var(--fg);
+}
+.composer-input::placeholder {
+  color: var(--placeholder);
+}
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+.spacer {
+  flex: 1;
+}
+.composer-actions .muted.small {
+  font-size: 11.5px;
+}
+button.send {
+  padding: 7px 18px;
+  font-size: 13.5px;
+  border: none;
+  border-radius: 9px;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  cursor: pointer;
+}
+button.send:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+button.cancel {
+  padding: 7px 14px;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--danger);
+  border: 1px solid var(--danger-border);
+  border-radius: 9px;
+  cursor: pointer;
+}
+button.gear {
+  padding: 6px 10px;
+  font-size: 12px;
+  background: var(--bg-subtle);
+  color: var(--fg-secondary);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+button.gear:hover {
+  background: var(--bg-hover);
+}
+
+/* ---- 高级设置面板 ---- */
+.composer-panel {
+  max-height: 44vh;
+  overflow-y: auto;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0 14px 14px;
+  background: var(--bg-subtle);
 }
 .field-label {
   display: block;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   margin: 0 0 6px;
 }
 .sub-title {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
-  margin: 18px 0 8px;
-}
-textarea {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 12px;
-  font-size: 14px;
-  line-height: 1.7;
-  border: 1px solid #ddd;
-  border-radius: 10px;
-  font-family: inherit;
-}
-textarea::placeholder {
-  color: #b0b0b0;
-}
-.title-input {
-  width: 100%;
-  box-sizing: border-box;
-  margin-bottom: 14px;
-  padding: 10px 12px;
-  font-size: 14px;
-  border: 1px solid #ddd;
-  border-radius: 10px;
-  font-family: inherit;
-}
-.hint-line {
-  margin: 6px 0 0;
-}
-.chapter-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 12px 0;
-}
-.tab {
-  padding: 6px 12px;
-  font-size: 12px;
-  background: #fff;
-  color: #0c447c;
-  border: 1px solid #d6e2ef;
-  border-radius: 999px;
-}
-.tab.active {
-  background: #0c447c;
-  color: #fff;
+  margin: 14px 0 8px;
 }
 .hint-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
+  gap: 10px;
 }
 .hint-grid textarea {
-  font-size: 13px;
-  padding: 9px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 9px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: inherit;
   resize: vertical;
-}
-.actions {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-wrap: wrap;
-  margin: 12px 0 4px;
-}
-button {
-  padding: 9px 22px;
-  font-size: 14px;
-  border: none;
-  border-radius: 9px;
-  background: #0c447c;
-  color: #fff;
-  cursor: pointer;
-}
-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.advanced {
-  margin: 20px 0 8px;
-  border: 1px dashed #ddd;
-  border-radius: 10px;
-  padding: 0 14px 12px;
-}
-.advanced summary {
-  cursor: pointer;
-  font-size: 13px;
-  color: #666;
-  padding: 10px 0;
+  background: var(--bg);
 }
 .mode-row {
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 16px;
   flex-wrap: wrap;
   margin-top: 12px;
-  font-size: 13px;
+  font-size: 12.5px;
 }
 .mode-row .field-label {
   display: inline;
@@ -547,11 +1082,11 @@ button:disabled {
   cursor: pointer;
 }
 .num {
-  width: 56px;
+  width: 54px;
   padding: 3px 6px;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 6px;
-  font-size: 13px;
+  font-size: 12.5px;
   margin: 0 4px;
 }
 .skill-list {
@@ -563,231 +1098,53 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 10px;
-  border: 1px solid #ddd;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
   border-radius: 999px;
-  font-size: 13px;
+  font-size: 12.5px;
   cursor: pointer;
-  background: #fff;
+  background: var(--bg);
 }
 .skill-item:hover {
-  border-color: #bbb;
+  border-color: var(--border-strong);
 }
 .skill-manual {
-  background: #fafafa;
+  background: var(--bg-inset);
   border-style: dashed;
 }
 .skill-refs {
-  color: #aaa;
+  color: var(--fg-muted);
   font-size: 11px;
 }
 .skill-name {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  font-size: 11.5px;
 }
 .skill-tag {
-  color: #888;
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: 11.5px;
 }
 .small {
   font-size: 12px;
 }
 .muted {
-  color: #888;
+  color: var(--fg-muted);
   font-weight: 400;
-}
-.err {
-  color: #c33;
-  font-size: 13px;
 }
 .warn {
-  color: #8a5a00;
-  background: #fff7e6;
+  color: var(--warning);
+  background: var(--warning-soft);
   border-radius: 8px;
   padding: 9px 12px;
-  font-size: 13px;
-  line-height: 1.6;
-}
-.result {
-  margin-top: 26px;
-  border-top: 1px solid #eee;
-  padding-top: 8px;
-}
-.meta {
-  font-size: 12px;
-  color: #999;
-  line-height: 1.7;
-}
-.block-title {
-  font-size: 15px;
-  margin: 26px 0 8px;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-.count {
-  font-size: 12px;
-  color: #999;
-  font-weight: 400;
-}
-.note {
-  font-size: 12px;
-  color: #999;
-  margin: 0 0 10px;
-}
-.cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 12px;
-}
-.card {
-  background: #f8f8f6;
-  border-radius: 10px;
-  padding: 13px 15px;
-}
-.card header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-.card b {
-  font-size: 14px;
-}
-.card p {
-  margin: 3px 0;
-  font-size: 13px;
-  line-height: 1.65;
-}
-.kv span {
-  display: inline-block;
-  min-width: 62px;
-  color: #999;
-  font-size: 12px;
-  margin-right: 6px;
-}
-.badge {
-  font-size: 11px;
-  background: #e8f0f9;
-  color: #0c447c;
-  border-radius: 999px;
-  padding: 2px 8px;
-  white-space: nowrap;
-}
-.badge.gray {
-  background: #eee;
-  color: #777;
-}
-.prompt {
-  margin-top: 9px;
-  border-top: 1px dashed #e2e2e2;
-  padding-top: 8px;
-}
-.prompt-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 12px;
-  color: #999;
-  margin-bottom: 4px;
-}
-.prompt p {
-  color: #333;
   font-size: 12.5px;
-  line-height: 1.7;
-}
-.copy {
-  background: #fff;
-  color: #0c447c;
-  border: 1px solid #d6e2ef;
-  border-radius: 6px;
-  font-size: 11px;
-  padding: 2px 8px;
-}
-.groups {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.group {
-  border: 1px solid #e8e8e8;
-  border-radius: 10px;
-  padding: 12px 14px;
-  background: #fff;
-}
-.group-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 8px;
-  font-size: 13px;
-}
-.blocking {
-  margin: 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.9;
-  color: #444;
-  white-space: pre-wrap;
-  background: #fafafa;
-  border-radius: 8px;
-  padding: 9px 11px;
-}
-.shot {
-  border-top: 1px solid #f0f0f0;
-  padding: 9px 0;
-}
-.shot:first-of-type {
-  border-top: none;
-}
-.shot-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.shot-no {
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  background: #0c447c;
-  color: #fff;
-  font-size: 11px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.tag {
-  font-size: 11px;
-  color: #555;
-  background: #f2f2f2;
-  border-radius: 5px;
-  padding: 2px 7px;
-}
-.tag.func {
-  background: #f6f0e4;
-  color: #8a5a00;
-}
-.shot-body {
-  font-size: 13px;
-  line-height: 1.65;
-  margin: 5px 0 3px;
-}
-.dialogue {
-  font-size: 13px;
-  color: #0c447c;
-  margin: 2px 0;
-}
-.blocking-line {
-  font-size: 12px;
-  color: #999;
-  margin: 3px 0 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.6;
 }
 @media (max-width: 720px) {
   .hint-grid {
     grid-template-columns: 1fr;
+  }
+  .msg.user .bubble {
+    max-width: 86%;
   }
 }
 </style>

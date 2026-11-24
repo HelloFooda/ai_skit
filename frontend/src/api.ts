@@ -142,6 +142,112 @@ export interface GenerateResponse {
   truncated: boolean;
 }
 
+/** 资产库：清单条目与三态状态 */
+export type PromptStatus = "draft" | "edited" | "approved";
+
+export interface PromptEntry {
+  id: string;
+  img_id: string;
+  category: string;
+  asset_name: string;
+  path: string;
+  status: PromptStatus;
+  body_hash: string;
+  updated_at: string;
+}
+
+export interface PromptDetail extends PromptEntry {
+  body: string;
+  generated_body: string;
+}
+
+export interface NovelAssetSummary {
+  name: string;
+  title: string;
+  updated_at: string;
+  entries: number;
+  draft: number;
+  edited: number;
+  approved: number;
+  /** 章节目录数（章节不进清单，按磁盘统计） */
+  chapters?: number;
+}
+
+/** 章节目录下的一份文档：角色站位.md / 分镜.md */
+export interface ChapterDoc {
+  name: string;
+  path: string;
+  size: number;
+  updated_at: string;
+}
+
+/** 一个章节目录：标题名 + 其下文档 */
+export interface ChapterEntry {
+  title: string;
+  path: string;
+  docs: ChapterDoc[];
+}
+
+/** 任意归档 Markdown 的正文（章节文档只读） */
+export interface AssetDocument {
+  path: string;
+  name: string;
+  body: string;
+}
+
+async function assetFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, init);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "请求失败");
+  }
+  return res.json();
+}
+
+export function listAssetNovels(): Promise<NovelAssetSummary[]> {
+  return assetFetch("/api/assets/novels");
+}
+
+export function listAssetPrompts(novel: string): Promise<PromptEntry[]> {
+  return assetFetch(`/api/assets/novels/${encodeURIComponent(novel)}/prompts`);
+}
+
+/** 章节目录与文档清单（只列文件名，正文走 getAssetDocument） */
+export function listAssetChapters(novel: string): Promise<ChapterEntry[]> {
+  return assetFetch(`/api/assets/novels/${encodeURIComponent(novel)}/chapters`);
+}
+
+/** 读任意归档 Markdown（章节站位/分镜只读查看） */
+export function getAssetDocument(novel: string, path: string): Promise<AssetDocument> {
+  return assetFetch(
+    `/api/assets/novels/${encodeURIComponent(novel)}/document?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export function getAssetPrompt(id: string): Promise<PromptDetail> {
+  return assetFetch(`/api/assets/prompts/${encodeURIComponent(id)}`);
+}
+
+export function saveAssetPrompt(id: string, body: string): Promise<PromptDetail> {
+  return assetFetch(`/api/assets/prompts/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+}
+
+export function approveAssetPrompt(id: string): Promise<PromptDetail> {
+  return assetFetch(`/api/assets/prompts/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+  });
+}
+
+export function regenerateAssetPrompt(id: string): Promise<PromptDetail> {
+  return assetFetch(`/api/assets/prompts/${encodeURIComponent(id)}/regenerate`, {
+    method: "POST",
+  });
+}
+
 export async function listSkills(categories?: string[]): Promise<SkillCatalogResponse> {
   const query = categories?.length
     ? `?categories=${encodeURIComponent(categories.join(","))}`
@@ -225,6 +331,78 @@ export interface NovelGenerateResponse {
   total_storyboards: number;
   injection_warning: boolean;
   gate_issue_count: number;
+  archive: {
+    root: string;
+    novel_dir: string;
+    files_written: number;
+    image_prompt_entries: number;
+    image_prompts_written: number;
+    prompts_skipped: number;
+    prompt_draft: number;
+    prompt_edited: number;
+    prompt_approved: number;
+    errors: string[];
+  } | null;
+}
+
+/** 生成进度事件：只报阶段，不含内容；total=0 表示总数未知（不确定态） */
+export interface ProgressEvent {
+  phase: "split" | "chapter" | "finalize" | "archive" | string;
+  text: string;
+  step: number;
+  total: number;
+}
+
+/** 进度流回调；done 拿到完整结果，error 拿到错误文案 */
+export interface StreamHandlers {
+  onProgress: (event: ProgressEvent) => void;
+  onDone: (result: NovelGenerateResponse) => void;
+  onError: (message: string) => void;
+  /** 供取消生成用（AbortController.signal） */
+  signal?: AbortSignal;
+}
+
+/** POST + ReadableStream 解析 SSE（EventSource 只支持 GET，带正文的请求不能用它） */
+export async function generateNovelStream(
+  req: NovelGenerateRequest,
+  handlers: StreamHandlers,
+): Promise<void> {
+  const res = await fetch("/api/pipeline/generate-novel/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+    signal: handlers.signal,
+  });
+  if (!res.ok || !res.body) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "请求失败");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE 帧以空行分隔；一次 read 可能含多帧或半帧，按 \n\n 切，末段留到下一轮。
+    let split: number;
+    while ((split = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+      let event = "";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7);
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!event || !data) continue;
+      const payload = JSON.parse(data);
+      if (event === "progress") handlers.onProgress(payload as ProgressEvent);
+      else if (event === "done") handlers.onDone(payload as NovelGenerateResponse);
+      else if (event === "error") handlers.onError(payload.message || "生成失败");
+    }
+  }
 }
 
 export async function generateNovel(req: NovelGenerateRequest): Promise<NovelGenerateResponse> {
@@ -238,4 +416,165 @@ export async function generateNovel(req: NovelGenerateRequest): Promise<NovelGen
     throw new Error(err.detail || "请求失败");
   }
   return res.json();
+}
+
+/** ---------------------------------------------------------------- 出图（S7 设定图投产） */
+
+/** 一张已落盘的设定图；完整技术档案走 getMediaSidecar */
+export interface MediaImageRecord {
+  id: string;
+  prompt_id: string;
+  novel: string;
+  category: string;
+  asset_name: string;
+  img_id: string;
+  /** 该条目的第几版；只增不减，旧版留着能退 */
+  version: number;
+  /** 相对小说目录的路径，读图走 mediaFileUrl */
+  path: string;
+  sidecar: string;
+  mime: string;
+  bytes: number;
+  sha256: string;
+  width: number | null;
+  height: number | null;
+  provider: string;
+  model: string;
+  size: string;
+  ratio: string;
+  seed: number | null;
+  fingerprint: string;
+  job_id: string;
+  /** 是否为该条目的当前选用版本 */
+  selected: boolean;
+  created_at: string;
+}
+
+/** 预览回告：算账不花钱，给确认码与阻塞项 */
+export interface MediaPreview {
+  job_id: string;
+  novel: string;
+  prompt_id: string;
+  img_id: string;
+  title: string;
+  category: string;
+  /** 确认码：CONFIRM <job_id> <fingerprint[:12]>，改任何参数都会失效 */
+  confirmation: string;
+  fingerprint: string;
+  prompt_hash: string;
+  prompt_chars: number;
+  provider: string;
+  model: string;
+  size: string;
+  ratio: string;
+  seed: number | null;
+  n: number;
+  state: string;
+  /** 非空表示现在提交必然失败 */
+  blocking: string[];
+  warnings: string[];
+  cost_estimate: number | null;
+  /** False 时只允许离线 fixture，真实厂商会被拒绝 */
+  allow_paid: boolean;
+  quota: { date: string; submitted: number; cost: number; quota: number; remaining: number | null };
+  /** 同指纹已有产物时直接给出，无需重跑 */
+  cached: MediaImageRecord | null;
+  images: MediaImageRecord[];
+  /** 已有图不是按当前提示词出的 */
+  prompt_stale: boolean;
+}
+
+export interface MediaImagesResponse {
+  novel: string;
+  images: MediaImageRecord[];
+  current_body_hash: Record<string, string>;
+}
+
+export interface MediaStreamHandlers {
+  onProgress: (event: ProgressEvent) => void;
+  /** 每落盘一张图推一条 */
+  onMedia: (image: MediaImageRecord) => void;
+  onDone: (payload: {
+    cached: boolean;
+    images?: MediaImageRecord[];
+    image?: MediaImageRecord;
+    latency_ms?: number;
+    cost_estimate?: number | null;
+    appended_suffix?: string;
+  }) => void;
+  onError: (message: string) => void;
+  signal?: AbortSignal;
+}
+
+/** 读图片本体：路径相对小说目录，后端校验越界与后缀 */
+export function mediaFileUrl(novel: string, path: string): string {
+  return `/api/media/file?novel=${encodeURIComponent(novel)}&path=${encodeURIComponent(path)}`;
+}
+
+export function previewMedia(promptId: string, seed?: number | null): Promise<MediaPreview> {
+  return assetFetch("/api/media/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt_id: promptId, seed: seed ?? null }),
+  });
+}
+
+export function listMediaImages(novel: string, promptId = ""): Promise<MediaImagesResponse> {
+  const query = promptId ? `?novel=${encodeURIComponent(novel)}&prompt_id=${encodeURIComponent(promptId)}` : `?novel=${encodeURIComponent(novel)}`;
+  return assetFetch(`/api/media/images${query}`);
+}
+
+export function selectMediaImage(imageId: string): Promise<MediaImageRecord> {
+  return assetFetch(`/api/media/images/${encodeURIComponent(imageId)}/select`, { method: "POST" });
+}
+
+export function getMediaSidecar(imageId: string): Promise<Record<string, unknown>> {
+  return assetFetch(`/api/media/images/${encodeURIComponent(imageId)}/sidecar`);
+}
+
+/**
+ * 提交出图。事件：progress 若干 → media 每张一条 → done；失败走 error。
+ * 与生成主链路共用同一套 SSE 解析手法（POST + ReadableStream）。
+ */
+export async function generateMediaStream(
+  promptId: string,
+  confirmation: string,
+  handlers: MediaStreamHandlers,
+): Promise<void> {
+  const res = await fetch("/api/media/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt_id: promptId, confirmation }),
+    signal: handlers.signal,
+  });
+  if (!res.ok || !res.body) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "请求失败");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let split: number;
+    while ((split = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+      let event = "";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7);
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!event || !data) continue;
+      const payload = JSON.parse(data);
+      if (event === "progress") handlers.onProgress(payload as ProgressEvent);
+      else if (event === "media") handlers.onMedia(payload as MediaImageRecord);
+      else if (event === "done") handlers.onDone(payload);
+      else if (event === "error") handlers.onError(payload.message || "出图失败");
+    }
+  }
 }

@@ -1,0 +1,82 @@
+/* 主题令牌：浅色与深色各一套。组件只引用变量，切换只改 <html data-theme>。 */
+:root {
+  --bg: #fff;
+  --bg-subtle: #f8f8f6;
+  --bg-inset: #fafafa;
+  --bg-hover: #eef0f3;
+  --fg: #1d1d1f;
+  --fg-secondary: #555;
+  --fg-muted: #8a8f95;
+  --placeholder: #b6bac0;
+  --border: #e2e5e9;
+  --border-strong: #ccc;
+  --accent-border: #d6e2ef;
+  --accent: #0c447c;
+  --accent-contrast: #fff;
+  --accent-soft: #e8f0f9;
+  --danger: #c33;
+  --danger-border: #f0c9c9;
+  --danger-soft: #fdecec;
+  --danger-soft-fg: #a12626;
+  --warning: #8a5a00;
+  --warning-soft: #fff7e6;
+  --success: #137333;
+  --success-soft: #e6f4ea;
+  --tag-bg: #f2f2f2;
+  --user-bubble: #f2f4f7;
+  --shadow: 0 2px 10px rgba(16, 24, 40, 0.04);
+  --drawer-shadow: -2px 0 12px rgba(0, 0, 0, 0.08);
+  --mask: rgba(0, 0, 0, 0.28);
+}
+
+:root[data-theme="dark"] {
+  --bg: #15181d;
+  --bg-subtle: #1e2229;
+  --bg-inset: #191d23;
+  --bg-hover: #2b323c;
+  --fg: #e6e9ee;
+  --fg-secondary: #b9c0ca;
+  --fg-muted: #8b939f;
+  --placeholder: #6b7380;
+  --border: #343b45;
+  --border-strong: #4b5563;
+  --accent-border: #2c4660;
+  --accent: #66a9ef;
+  --accent-contrast: #0d1420;
+  --accent-soft: rgba(102, 169, 239, 0.14);
+  --danger: #ff7b7b;
+  --danger-border: #5c3338;
+  --danger-soft: rgba(255, 123, 123, 0.13);
+  --danger-soft-fg: #ff9d9d;
+  --warning: #e8b45c;
+  --warning-soft: rgba(232, 180, 92, 0.14);
+  --success: #5fd08b;
+  --success-soft: rgba(95, 208, 139, 0.14);
+  --tag-bg: #292f38;
+  --user-bubble: #262c35;
+  --shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+  --drawer-shadow: -2px 0 12px rgba(0, 0, 0, 0.45);
+  --mask: rgba(0, 0, 0, 0.55);
+}
+
+/* 全局重置：对话页用整屏高度，去掉浏览器默认外边距避免出现多余滚动条 */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+}

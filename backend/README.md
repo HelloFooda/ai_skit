@@ -10,5 +10,5 @@ FastAPI 后端：小说章节 → 五类文生文描述（角色 / 道具 / 场�
 
 ```bash
 uv sync --frozen
-uv run uvicorn app.main:app --reload --port 8000
+uv run uvicorn app.main:app --reload --port 8001
 ```

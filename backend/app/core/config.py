@@ -53,5 +53,8 @@ class Settings(BaseSettings):
     # 一次注入的技能总字数预算（约等于 0.6 token/字符的成本，按需调）
     skills_budget_chars: int = 60_000
 
+    # ---- 资产归档根目录；留空则用 <仓库>/assets（见 generation/archive.py）
+    asset_root: str = ""
+
 
 settings = Settings()

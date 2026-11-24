@@ -384,6 +384,233 @@ class ChapterOutput(BaseModel):
     truncated: bool = False
 
 
+# ---------------------------------------------------------------- 资产库清单与三态
+
+PromptStatus = Literal["draft", "edited", "approved"]
+
+
+class PromptEntry(BaseModel):
+    """清单里的一条提示词索引：定位信息与状态，正文只在 md 文件里。"""
+
+    id: str = Field(description="稳定 id：img-<category>-<hash8>，用于 API 寻址")
+    img_id: str = Field(description="展示标签：IMG-CHAR-001 等，按渲染顺序编号")
+    category: str = Field(description="character / scene / prop")
+    asset_name: str = Field(description="资产名，跨章合并后的唯一名")
+    path: str = Field(description="相对小说目录的提示词文件路径")
+    status: PromptStatus = Field(default="draft", description="draft / edited / approved")
+    body_hash: str = Field(default="", description="正文 sha256，判断模板版本是否变化")
+    updated_at: str = Field(default="", description="最近更新时间（UTC ISO）")
+
+
+class PromptDetail(PromptEntry):
+    """单条提示词全文：正文 + 可选的模板对照副本。"""
+
+    body: str = Field(default="", description="当前正文，从 md 文件读出")
+    generated_body: str = Field(
+        default="", description="`.generated.md` 模板对照版本；空串表示没有对照"
+    )
+
+
+class MediaImageRecord(BaseModel):
+    """一张已落盘的设定图。清单里只存索引，完整技术档案在同目录 `-vN.json`。"""
+
+    id: str = Field(description="稳定 id：mi-<hash10>，由 prompt_id + 版本派生，API 按它寻址")
+    prompt_id: str = Field(description="所属提示词条目 id")
+    novel: str = Field(description="小说目录名")
+    category: str = Field(default="", description="character / scene / prop")
+    asset_name: str = Field(default="", description="条目名，如「唐欣妍」")
+    img_id: str = Field(default="", description="展示标签，如 IMG-CHAR-001")
+    version: int = Field(default=1, ge=1, description="该条目的第几版；只增不减、不复用")
+    path: str = Field(description="相对小说目录的图片路径，如 角色/唐欣妍/图片/唐欣妍-v1.png")
+    sidecar: str = Field(default="", description="相对小说目录的技术档案路径")
+    mime: str = Field(default="image/png")
+    bytes: int = Field(default=0)
+    sha256: str = Field(default="")
+    width: int | None = None
+    height: int | None = None
+    provider: str = Field(default="", description="产出厂商名，如 fixture")
+    model: str = Field(default="")
+    size: str = Field(default="")
+    ratio: str = Field(default="")
+    seed: int | None = None
+    fingerprint: str = Field(default="", description="生成时指纹；提示词一改就不再匹配")
+    job_id: str = Field(default="")
+    selected: bool = Field(default=False, description="是否为该条目的当前选用版本")
+    created_at: str = Field(default="")
+
+
+class AssetManifest(BaseModel):
+    """一本小说的 `_manifest.json`：提示词条目清单 + 已出图索引。"""
+
+    novel: str = Field(description="小说名（净化后的目录名）")
+    updated_at: str = Field(default="", description="清单最近更新时间（UTC ISO）")
+    entries: list[PromptEntry] = Field(default_factory=list)
+    images: list[MediaImageRecord] = Field(
+        default_factory=list, description="已落盘设定图索引（正文与文件在 图片/ 下）"
+    )
+
+
+class NovelAssetSummary(BaseModel):
+    """小说列表的一项：目录名 + 状态计数。"""
+
+    name: str = Field(description="归档目录名，API 用它定位")
+    title: str = Field(description="清单记录的小说名")
+    updated_at: str = Field(default="")
+    entries: int = Field(default=0)
+    draft: int = Field(default=0)
+    edited: int = Field(default=0)
+    approved: int = Field(default=0)
+    chapters: int = Field(default=0, description="章节目录数（不在清单里，按磁盘统计）")
+
+
+class ChapterDoc(BaseModel):
+    """章节目录下的一份文档：`角色站位.md` / `分镜.md`。"""
+
+    name: str = Field(description="文件名，含 .md 后缀")
+    path: str = Field(description="相对小说目录的路径，如 章节/第1章/分镜.md")
+    size: int = Field(default=0, description="字节数")
+    updated_at: str = Field(default="", description="文件 mtime（UTC ISO）")
+
+
+class ChapterEntry(BaseModel):
+    """一个章节目录：标题目录名 + 其下文档。
+
+    章节不是提示词条目，没有 `IMG-...` 编号与三态状态，所以不进 `_manifest.json`，
+    由 `asset_store.list_chapters` 直接读磁盘目录得到。
+    """
+
+    title: str = Field(description="章节目录名，如 第1章")
+    path: str = Field(description="相对小说目录的路径，如 章节/第1章")
+    docs: list[ChapterDoc] = Field(default_factory=list)
+
+
+class AssetDocument(BaseModel):
+    """任意一份归档 Markdown 的正文（章节文档只读用）。"""
+
+    path: str = Field(description="相对小说目录的路径")
+    name: str = Field(description="文件名")
+    body: str = Field(default="", description="文件正文")
+
+
+class PromptSaveRequest(BaseModel):
+    """PUT /api/assets/prompts/{id} 的请求体。"""
+
+    body: str = Field(max_length=20_000, description="编辑后的完整 Markdown 正文")
+
+
+class ProgressEvent(BaseModel):
+    """生成进度流的一条阶段事件：只报"做到哪一步"，不含任何生成内容。"""
+
+    phase: str = Field(description="阶段标识：split / chapter / finalize / archive")
+    text: str = Field(description="给人看的阶段文案，前端直接渲染")
+    step: int = Field(default=0, ge=0, description="当前步序号；0 表示总数未知（如切分前）")
+    total: int = Field(default=0, ge=0, description="总步数；0 表示不确定态")
+
+
+# ---------------------------------------------------------------- 出图（S7 设定图投产）
+
+
+class MediaPreviewRequest(BaseModel):
+    """POST /api/media/preview：算账不花钱。"""
+
+    prompt_id: str = Field(description="提示词条目 id（清单里的 img-<category>-<hash8>）")
+    seed: int | None = Field(default=None, description="固定种子；留空则每次不同")
+
+
+class MediaPreviewResponse(BaseModel):
+    """预览回告：指纹 + 确认码 + 阻塞项 + 额度。确认码绑定当前指纹，改任何参数都会失效。"""
+
+    job_id: str
+    novel: str
+    prompt_id: str
+    img_id: str = ""
+    title: str = ""
+    category: str = ""
+    confirmation: str = Field(description="确认码：CONFIRM <job_id> <fingerprint[:12]>")
+    fingerprint: str = ""
+    prompt_hash: str = ""
+    prompt_chars: int = Field(default=0, description="可复制提示词正文字符数，供成本与长度判断")
+    provider: str = ""
+    model: str = ""
+    size: str = ""
+    ratio: str = ""
+    seed: int | None = None
+    n: int = 1
+    state: str = Field(default="planned", description="planned / confirmed / submitted / done / failed")
+    blocking: list[str] = Field(default_factory=list, description="非空表示现在提交必然失败")
+    warnings: list[str] = Field(default_factory=list)
+    cost_estimate: float | None = None
+    allow_paid: bool = Field(default=False, description="False 时只允许离线 fixture")
+    quota: dict = Field(default_factory=dict)
+    cached: MediaImageRecord | None = Field(
+        default=None, description="同指纹已有产物时直接给出，无需重跑"
+    )
+    images: list[MediaImageRecord] = Field(default_factory=list, description="该条目已有全部版本")
+    prompt_stale: bool = Field(
+        default=False, description="已有图不是按当前提示词出的（提示词改过）"
+    )
+
+
+class MediaGenerateRequest(BaseModel):
+    """POST /api/media/generate：必须带上与当前指纹匹配的确认码。"""
+
+    prompt_id: str
+    confirmation: str = Field(description="预览返回的确认码，逐字回传")
+
+
+class MediaImagesResponse(BaseModel):
+    """GET /api/media/images：某本小说（可限定条目）已出的图。"""
+
+    novel: str
+    images: list[MediaImageRecord] = Field(default_factory=list)
+    current_body_hash: dict[str, str] = Field(
+        default_factory=dict, description="prompt_id → 当前正文 hash，用于判断旧图是否过期"
+    )
+
+
+class MediaSelectRequest(BaseModel):
+    """POST /api/media/images/{id}/select。"""
+
+
+
+class MediaJobStatusResponse(BaseModel):
+    """GET /api/media/jobs：任务状态与额度。"""
+
+    novel: str
+    jobs: list[dict] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    quota: dict = Field(default_factory=dict)
+
+
+class ArchiveReport(BaseModel):
+    """资产归档回告：落了多少文件、聚合/实际写了多少条目、有没有局部失败。
+
+    归档是生成成功后的副作用，失败只记 error，不改生成结果、不抛 500。
+    """
+
+    root: str = Field(description="归档根目录（已解析为绝对路径字符串）")
+    novel_dir: str = Field(description="本次小说落盘的目录")
+    files_written: int = 0
+    characters: int = Field(default=0, description="跨章去重后的角色数")
+    props: int = Field(default=0, description="跨章去重后的道具数")
+    scenes: int = Field(default=0, description="跨章去重后的场景数")
+    characters_written: int = 0
+    props_written: int = 0
+    scenes_written: int = 0
+    image_prompt_entries: int = Field(
+        default=0, description="由资产事实模板拼出的 IMG-... 条目数（零 LLM 调用）"
+    )
+    image_prompts_written: int = Field(default=0, description="本次实际写入主文件的提示词文档数")
+    prompts_skipped: int = Field(
+        default=0, description="因 edited/approved 被跳过覆盖、改写对照副本的提示词数"
+    )
+    prompt_draft: int = Field(default=0, description="归档后 draft 状态的提示词总数")
+    prompt_edited: int = Field(default=0, description="归档后 edited 状态的提示词总数")
+    prompt_approved: int = Field(default=0, description="归档后 approved 状态的提示词总数")
+    chapters: int = Field(default=0, description="落了站位或分镜的章数")
+    errors: list[str] = Field(default_factory=list, description="局部失败说明；非空表示部分落盘")
+
+
 class NovelPipelineResponse(BaseModel):
     run_id: str
     model: str
@@ -400,6 +627,8 @@ class NovelPipelineResponse(BaseModel):
     total_storyboards: int = 0
     injection_warning: bool = False
     gate_issue_count: int = 0
+    # 资产归档回告；未触发（如无章）时为 None，局部失败见 archive.errors
+    archive: ArchiveReport | None = None
 
 
 def chapter_output(item: dict) -> ChapterOutput:

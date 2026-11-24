@@ -16,7 +16,7 @@
   | 环节 | 模型 / 通道 | 约束 |
   | --- | --- | --- |
   | 文生文（视觉设定、分镜、提示词） | LLM，走 LangChain：`app/generation/graph.py` 多章图 → `app/generation/chapters.py` 切章 → `app/generation/agent.py` 章内 agent（模型自选工具 + 顺序闸门）→ `app/generation/llm.py` 单章两段 → `app/generation/chains.py` LCEL 链（`app/generation/prompts.py` 出 system） | 厂商由 `LLM_PROVIDER` 配置指定，业务代码不写死；章节原文不进模板引擎；多章顺序由图边固定，章内顺序由中间件守 |
-  | 文生图（设定图） | `$short-drama-produce` 的适配器（内置 `seedance` / `minimax-h3`） | 先有 `IMG-...` 条目再投产；一张一交 |
+  | 文生图（设定图） | 本项目 `app/media/` 端口 + provider（`fixture` 离线 / `ark` 真实）；厂商由 `MEDIA_IMAGE_PROVIDER` 指定 | 先有 `IMG-...` 条目再投产；一张一交；`preview → confirm → run` 三步，`MEDIA_ALLOW_PAID=false` 时只允许离线 |
   | 图生 / 文生视频 | 同上，按 `short-drama.json#/creator_authority/production_profile` 选型 | 单条时长上限 4–15s；参考图/参考音频按模型能力绑定 |
 - **三条不变式**：① 章节原文逐字零容错；② 产物落盘、每阶段可单独重跑；③ 一条投产任务 = 一个 `MOTION-...` 或一个 `GROUP-...`。
 
@@ -79,6 +79,16 @@
 - **一张一交，出完自查即交，不抽卡、不默默重跑第二版**；换版不删旧图（`男主-v2.png` 留着能退）。
 - 参考图 = 设定图整张：不截图、不裁切、不照板再出单图。
 - 投产走 `$short-drama-produce`（先 `prepare` 看预览与计费，再 `confirm` + `run`）。
+- **本项目接口实现口径**：S3 不单独调 LLM——资产 `prompt` 已是整合好的外观事实，由
+  `app/generation/image_prompts.py` 按上面的六段顺序拼固定版式外壳，随归档落到
+  `assets/<小说名>/<分类目录>/<资产名>/<资产名>-图片提示词.md`（每资产一份、编号全局连续）。
+  这是 S3 在接口层的等价实现；同板对照多状态、参考图绑定、连戏锁与字迹规则仍需人工复核，
+  代码默认单状态、无外部参考、道具表面无字。
+- **画面分区口径（三类资产统一）**：设定图按三区域分栏——上部占高 2/3，左主区占宽 2/3
+  （角色三视图 / 场景主视角全景 / 道具整体形制），右子区占宽 1/3（头肩特写 / 关键陈设局部 /
+  关键结构特写）；下部占高 1/3、满宽为细节区，局部放大展示资产描述中对应部位的细节。
+  细节区**只复用同一份资产事实并指明部位**，不新增外观；正文显式声明分栏边界，
+  不写「几宫格」这类空排版词。落地点是 `app/generation/image_prompts.py` 的三个 body 模板。
 
 ### S4 写分镜与首帧（`$short-drama-storyboard`）
 
@@ -117,6 +127,38 @@
 - `status` 只看真实任务状态；`collect` 只取既有远端结果，**绝不重复计费提交**（`collect_provider_job_id`）。
 - 失败分片单独重跑，不影响其它镜；`audit` 核对运行记录与产出字节，发现 `orphaned_provider_job` 先 `collect` 再谈重试。
 
+#### S7 的设定图分支（本项目接口层，`app/media/`）
+
+技能包的 `production_tool.py` 只认「`剧集/<EP>/图片提示词.md` + `制作成果/`」这套运行时项目目录，而本项目的
+`IMG-...` 落在 `assets/<小说名>/<分类目录>/<条目名>/`。**不镜像目录、不造第二份事实源**，改为在接口层
+用同一套协议语义自建一层薄任务层（`app/media/`），只借语义、不复用脚本：
+
+| 技能包 | 本项目 | 花钱 |
+| --- | --- | --- |
+| `prepare` | `POST /api/media/preview` | 否 |
+| `confirm` | 前端拿到确认码，用户点击后原样回传 | 否 |
+| `run` | `POST /api/media/generate`（SSE） | 是 |
+| `status` / `collect` | `GET /api/media/jobs` / `POST /api/media/collect` | 否 |
+
+- **厂商无关**：业务层只认 `contract.MediaProvider` 端口（`generate` / `collect` 两个方法），厂商名只允许
+  出现在 `app/media/providers/` 里。换厂商 = 改 `.env` 的 `MEDIA_IMAGE_PROVIDER`，业务代码不动。
+  校验口径：`grep -rn "volcengine\|doubao\|seedream" backend/app/` 在 `providers/` 之外应为零命中。
+- **能力由 provider 声明，约束由业务层兜底**：能出多大图、要不要异步、能挂几个参考素材写进
+  `Capabilities`；4–15 秒单条上限、16:9 画幅这类创作规则不交给 provider 判断。
+- **两道钱闸门**：`MEDIA_ALLOW_PAID` 默认 `false`，未显式打开时拒绝装配任何真实厂商（只允许 `fixture`）；
+  另有 `MEDIA_DAILY_QUOTA` 日额度熔断。两者都是**本地预检**，失败不核销确认码。
+- **指纹与确认码**：指纹 = sha256(提示词正文 hash + provider + model + size + ratio + seed + 参考图 hash)；
+  确认码 `CONFIRM <job_id> <fingerprint[:12]>` 绑定当前指纹，改一个字就失效。
+  `submitted=false`（本地预检失败）保留确认码；`submitted=true`（请求已发出）核销，重试须重新确认。
+- **幂等**：同指纹已成功出图则直接返回那张图，绝不重复提交。
+- **换版不删旧图**：版本号取该条目已有最大版本 +1，永不复用；人工可切回任意旧版。
+- **提示词逐字**：`MediaRequest.prompt` 逐字取自 `### 可复制提示词` 的引用块。画幅比例只作为技术参数
+  传 `ratio`，由 provider 决定怎么落地（档位模式下追加一句最小技术尾巴），追加内容如实记进
+  `MediaResult.appended_suffix` 供回溯。
+- **不做 agent 层**：S7 出图没有决策点（拿到提示词就调一次 provider），套 `create_agent` 只会白烧一次
+  LLM 调用；套 StateGraph 也只是把线性三步画成图，而确认码是**人**的动作、不是图的状态转移。
+  批量编排与 `interrupt()` 人工确认留到多条目批量阶段再上图。
+
 ### S8 交付与归档
 
 - 按镜序合成 `制作成果/成片/`（首版只做顺序拼接 + 简单转场，剪辑单落 `剪辑单.md`）。
@@ -142,6 +184,78 @@
 | `storyboards` | `分镜.md` 的 `SHOT-...` | 第二段生成，按投产分组打包（4–15s/组，默认最多 6 组） |
 
 响应还带 `gate_issues`（机检）、`total_groups_estimated` 与 `truncated`（是否被组数上限截断）、`stages`（分段耗时 + `usage` token 归因）、`skills_*`（装载与展开情况）。单章路径 `/generate` 只填 `chapter`；多章主路径 `/generate-novel` 填 `novel_title` 与 `content` 两个字段，其余全是可选。
+
+### 资产归档（`POST /api/pipeline/generate-novel` 自动生成）
+
+`/generate-novel` 成功后，用请求里的**小说名 + 章节标题 + 逐章产出**自动落一份目录树到仓库根 `assets/`（配置 `LLM_ASSET_ROOT` 可改，默认 `<仓库>/assets`）。这是对 JSON 响应的**补充**，不是替代；归档失败只记日志、不改响应、不让已成功的生成变 500。落盘格式统一 Markdown，与技能包的文档链路对齐。
+
+```
+assets/<小说名>/                     # 小说名来自请求，逐字保留、只做文件名净化
+├── 角色/                           # ★ 固定分类目录（不随角色名变），其下才是条目名目录
+│   └── <角色名>/                   # 跨章同名合并为一个
+│       ├── <角色名>.md             # 角色：外观/稳定特征/本集状态/声线/资产描述
+│       └── <角色名>-图片提示词.md  # S3：该角色的 IMG-... 设定图提示词（模板拼装，零 LLM）
+├── 场景/                           # ★ 固定分类目录
+│   └── <场景名>/
+│       ├── <场景名>.md             # 场景：时间/光线/氛围/资产描述
+│       └── <场景名>-图片提示词.md  # S3：空镜设定图提示词
+├── 道具/                           # ★ 固定分类目录：所有道具都在这，含归属角色的
+│   └── <道具名>/
+│       ├── <道具名>.md             # 道具：归属角色/外观/状态变化/资产描述
+│       └── <道具名>-图片提示词.md  # S3：道具设定图提示词
+└── 章节/                           # ★ 固定分类目录（与上面三类同一套结构，用户认可的范本）
+    └── <章节标题>/                 # 取标题主名（如「序章」「第一章」），逐章一个
+        ├── 角色站位.md             # 该章 blockings，按组
+        └── 分镜.md                 # 该章 storyboards，逐组逐镜（台词逐字取自原文）
+```
+
+**两级口径**：`<分类目录>/<条目名>/<条目名>.md`。分类目录只有四个固定中文名
+（`角色` / `场景` / `道具` / `章节`，见 `asset_store.CATEGORY_DIRS` / `CHAPTER_DIR`），
+永不随资产名变化；条目名目录才是小说里对应的角色名/场景名/道具名/章节名。
+
+归档口径（对应 `app/generation/archive.py`）：
+
+- **资产按名去重、跨章合并**：角色 / 场景 / 道具以 `name` 为键，同名只建一个条目，多条来源在文件里列出「出现章节」；不复制多份。
+- **道具一律进 `道具/<道具名>/`**：`owner` 只写进道具正文的「归属角色」，**不决定落盘位置**——角色目录里只有角色自己的两份文档，不会混进道具；`owner` 为空或对不上角色名也不影响落盘，不建孤儿目录。
+- **S3 图片提示词与资产同阶段拼装，不额外调 LLM**：S2 资产的 `prompt` 字段已把
+  appearance/stable_features/state 整合成外观事实（见 schemas 注释），这里只补技能包规定的
+  固定版式外壳（设定图类型 → 核心外观 → 本张状态 → 构图版式 → 材质布光 → 清场与字迹排除），
+  由 `app/generation/image_prompts.py` 的纯函数拼接，落 `<名称>-图片提示词.md` 到资产同目录。
+  `IMG-CHAR-... / IMG-SCENE-... / IMG-PROP-...` 编号全局连续；事实主体逐字取资产 `prompt`，
+  为空则按结构化字段回退，仍为空则跳过并回告 warning，绝不编造外观。
+- **S3 边界**：只产 `IMG-...` 提示词，不生成图片、不绑定 `REF-...` 参考图（一律写「无外部参考」）、
+  不拍板字迹规则（道具默认无可读字，需可读字句时人工按 `IMG-07` 改写）；连戏锁也需出图前人工复核。
+  站位与分镜仍属 S4，不在本阶段产出。
+- **章节只落站位与分镜**：每章标题目录里只有 `角色站位.md` 和 `分镜.md` 两份，不落原文（原文逐字保真以输入与响应为准，归档层不复制正文）。`assets_only` 模式没有站位/分镜，仍按资产部分归档。
+- **文件名净化、防越界**：小说名/角色名/场景名/道具名/章节名一律经统一净化——去路径分隔符与控制字符、`..` 与纯点名替换为占位名、同名冲突加序号；条目名撞上保留目录名（`角色`/`场景`/`道具`/`章节`）时同样加序号，不往分类目录里塞条目；禁止任何名字跳出 `<小说名>/` 目录。
+- **幂等覆盖 + 人工修订保护**：同小说名 + 同名条目重跑覆盖原文件（临时文件 + 原子重命名），不追加旧内容。唯一的例外是图片提示词：已编辑 / 已定稿的条目（见 `_manifest.json` 三态）不被重跑覆盖，新模板版本另写 `<名称>-图片提示词.generated.md` 对照副本，由人决定是否采用。归档不做静默清理——旧名字残留目录不删。
+- **失败语义**：归档异常（磁盘只读、路径非法等）只写 error 日志并回告空/部分报告，生成结果照常返回；归档不是生成的前置闸门。
+- **存量迁移**：结构变更前的旧目录（角色/场景平铺在小说根、道具挂角色目录）不会自动搬家。用一次性脚本 `backend/tests/manual/migrate_asset_layout.py` 处理：先 `--dry-run` 看计划，再执行；按清单 `category` / 文档标题逐文件判定类别，只移动不删除，目标已存在则报冲突跳过，搬完清空空壳目录（`--keep-empty` 保留）。
+
+### 资产库：清单、三态与读写接口
+
+归档目录是**唯一事实源**，前端不再从响应里读资产，而是读目录 + 清单。每本小说目录下有一份 `_manifest.json`：
+
+```
+assets/<小说名>/_manifest.json       # 提示词条目清单：id / img_id / category / asset_name / path / status / body_hash / updated_at
+```
+
+- **稳定 id**：`id = img-<category>-<hash8>`，hash8 = sha1(f"{category}:{asset_name}") 前 8 位；资产顺序变化不漂移。`img_id`（`IMG-CHAR-001` 等）只作展示标签，不用于定位。API 按 `id` 寻址。
+- **三态状态机**：`draft`（模板生成）→ `edited`（人工保存过）→ `approved`（定稿）。`archive.py` 渲染写盘时：无条目则建 draft；draft 则覆盖并更新 hash；edited/approved 则**跳过主文件**、若模板正文 hash 变化则写 `.generated.md` 对照副本。定稿的条目永不被动到，除非人工显式重渲染。
+- **正文只在文件里**：清单存路径与 hash，不存正文；读接口从 `path` 读实际文件，写接口原子写回并刷新 hash。这样手工改文件仍生效、清单只是索引。
+- **接口（`app/api/assets.py`，前缀 `/api/assets`）**：`GET /novels` 列小说（带提示词三态计数与章节数）；`GET /novels/{novel}/prompts` 列提示词条目（按 category 分组、带状态）；`GET /novels/{novel}/chapters` 列章节目录与其下文档；`GET /novels/{novel}/document?path=` 读任意归档 Markdown（章节站位/分镜只读）；`GET /prompts/{id}` 读单条（含模板对照）；`PUT /prompts/{id}` 保存编辑（校验 `IMG-...` 结构、合法状态迁移）；`POST /prompts/{id}/approve` 定稿；`POST /prompts/{id}/regenerate` 用 `.generated.md` 覆盖主文件回 draft。路径安全：novel 名与 id 都经净化 + `resolve()` 越界校验，document 的 `path` 同样校验必须落在小说目录内且只允许 `.md`，禁止读 `<asset_root>` 外任何文件。
+- **章节与提示词分开管**：章节没有 `IMG-...` 编号、没有三态状态，**不进 `_manifest.json`**，由 `asset_store.list_chapters` 直接读磁盘 `章节/<章节标题>/` 得到，前端只读展示（不提供编辑/定稿）。提示词条目走清单，两者在资产库页拼成同一棵树展示。
+- **边界**：编辑只动正文，不改 id / category / asset_name（派生关系）；不回填资产 `prompt` 字段（资产是事实源，提示词是派生物，回填会破坏"逐字继承"契约）；不做编辑历史与多人锁（单机工具，原子写足够）。
+
+### 生成进度流（`POST /api/pipeline/generate-novel/stream`）
+
+生成主链路（尤其真实模型调用）耗时较长，前端用 SSE 展示阶段进度，避免用户干等。进度只报"做到哪一步"，**不推任何生成内容**（内容仍只在 done 事件的结果里一次性返回）。
+
+- **框架原生，零手搓**：阶段进度用 LangGraph 的 `get_stream_writer()` 在图节点内发 `custom` 事件，编译图用 `stream(stream_mode=["custom", "values"])` 同时拿进度与最终 state。不自己写断点解析器、不引入额外队列/线程池。
+- **`invoke` 无副作用**：`get_stream_writer()` 在非流式 `invoke` 下是 no-op，原 `/generate-novel` 与全部单测行为不变；两条路径共用同一份图节点实现，不复制逻辑。
+- **SSE 协议**：FastAPI `StreamingResponse`（`text/event-stream`）。事件按序：`progress`（`{"step","total","text","phase"}`）若干条 → `done`（完整 `NovelPipelineResponse`，含归档报告）一条；异常走 `error` 事件（`{"message"}`）而不是断连。`stream_mode=values` 的 chunk 不外发，只用来取 final。
+- **阶段划分**：切分（正在分章 → 分章完成，共 N 章）→ 每章生成（正在生成第 i/N 章《标题》→ 该章完成）→ 聚合 → 构建图片提示词与归档（路由层发）。每阶段文案在后端集中定义，前端只渲染。
+- **前端**：生成页是对话形态（消息气泡 + 底部输入框），不是表单。`fetch` + `ReadableStream` 自解析 SSE（POST 带正文，不能用只支持 GET 的 `EventSource`）；每条 `progress` 渲染成助手消息里的一步（进行中转圈、完成打勾），不做独立进度条；`done` 后在下一轮消息里渲染与老端点完全相同的结果。老端点保留向后兼容。
 
 ### 文生文通道分层（LangChain）
 
@@ -190,18 +304,52 @@ ai_skit/
 ├── backend/                     # FastAPI + uv 管项目级 .venv
 │   ├── app/                     # 按职责分五个子包，根目录只留入口
 │   │   ├── main.py              # FastAPI 入口 + 日志初始化 + 中间件挂载
-│   │   ├── api/                 # HTTP 接口层：/generate-novel、/generate、/skills；errors.py 收口异常→状态码
+│   │   ├── api/                 # HTTP 接口层：pipeline / assets / media 三个路由 + errors.py（异常→状态码收口）
+│   │   │   ├── pipeline.py      # /generate-novel、/generate、/skills
+│   │   │   ├── assets.py        # 资产库读写：列小说/列提示词/读单条/保存编辑/定稿/重渲染（路径安全校验）
+│   │   │   └── media.py         # 出图：preview / generate（SSE）/ collect / images / file
 │   │   ├── core/                # 核心层：config.py（配置）+ schemas.py（数据契约）
 │   │   ├── generation/          # 生成层：prompts → chains → llm → agent → graph + chapters.py + mock_data.py
+│   │   │   ├── graph.py         # LangGraph：split → generate（按章回环，内部进 agent）→ finalize；节点内 get_stream_writer 发进度
+│   │   │   ├── archive.py       # 资产归档：final → assets/<小说名>/ 目录树（Markdown、跨章去重、原子写、尊重三态）
+│   │   │   ├── image_prompts.py # S3 图片提示词：资产事实 + 固定版式模板 → IMG-...（纯函数、零 LLM）
+│   │   │   └── asset_store.py   # 资产库清单：_manifest.json 读写、稳定 id、三态迁移、路径安全
 │   │   ├── observability/       # 可观测层：logging.py（日志回调）+ usage.py（token 提取）+ middleware.py（请求中间件）
+│   │   ├── media/               # ★ 出图层（S7 设定图）：端口 + provider + 任务层
+│   │   │   ├── contract.py      # MediaProvider 端口、MediaRequest/Capabilities/MediaResult、错误分类
+│   │   │   ├── settings.py      # MEDIA_* 配置（独立前缀，不认识具体厂商）
+│   │   │   ├── jobs.py          # 指纹、确认码、任务状态机、日额度账本（_media/）
+│   │   │   ├── store.py         # 图片落盘：图片/<条目>-vN.png + sidecar + manifest.images[]
+│   │   │   ├── service.py       # preview / generate_stream / collect（三步协议的业务实现）
+│   │   │   └── providers/       # ★ 唯一允许出现厂商名的地方：fixture（离线）/ ark（真实）
 │   │   └── knowledge/           # 知识层：skills.py（SKILL.md + references 加载）
 │   ├── skills/                  # ★ 技能包（12 个 short-drama-*，不改内容）
 │   ├── skill-bindings.yaml      # 项目侧「技能 → 类别」绑定表
 │   └── tests/                   # ★ 所有测试统一放这里，按类型分子目录
 │       ├── unit/                # 标准库 unittest 单测（discover 默认跑这里）
 │       └── manual/              # 手工试跑脚本（真实调用等，需凭据/网络，不参与 discover）
-└── frontend/                    # Vue 3 + Vite
+├── frontend/                    # Vue 3 + Vite
+└── assets/                      # ★ 运行时自动生成的资产归档（generate-novel 落盘，见第 3 节「资产归档」）；可入库或按需要 gitignore
+    └── <小说名>/
+        ├── 角色/<角色名>/  场景/<场景名>/  道具/<道具名>/  章节/<章节标题>/
 ```
+
+**归档产物目录（运行时生成，是否入库按需）**
+
+```
+<仓库>/assets/<小说名>/            # 由 /generate-novel 自动落盘，结构见第 3 节「资产归档」
+├── _manifest.json                 # 提示词清单；出图后追加 images[]（图片索引）
+├── _media/jobs/<job_id>.json      # 出图任务状态（每本小说一套）
+├── 角色/<角色名>/                 # 固定分类目录；其下才是 <条目名>/ 目录
+│   └── 图片/                      # S7 出图产物：<条目名>-vN.png + <条目名>-vN.json（sidecar）
+├── 场景/<场景名>/                 #   每目录：<条目名>.md + <条目名>-图片提示词.md
+├── 道具/<道具名>/                 #   道具一律在这里，不挂进角色目录
+└── 章节/<章节标题>/               # 每章仅两份：角色站位.md + 分镜.md
+```
+
+- **图片与提示词同目录**：`图片/` 建在条目目录下，版本号只增不减、永不复用；sidecar 记指纹/模型/参数/seed/成本/耗时，图片本体是事实源、sidecar 只是档案。
+- `_media/` 是任务层状态，**不是创作文档**：删掉只会丢任务历史，不影响已出的图（图在 `图片/`，索引在 `_manifest.json`）。
+- **额度账本在资产根、跨小说一份**：`assets/_media_ledger.json`。日额度是「这台机器今天最多花几次」的全局闸门，不按小说分账；保留最近 60 天。
 
 **运行时项目目录（由 `project_tool.py init` 建在仓库外，不入库）**
 
@@ -228,7 +376,7 @@ ai_skit/
 cd backend && uv sync
 uv run python -m unittest discover -s tests -v
 uvx ruff check app tests
-uv run uvicorn app.main:app --reload --port 8000
+uv run uvicorn app.main:app --reload --port 8001
 
 # 前端
 cd frontend && npm run build        # vue-tsc --noEmit && vite build
@@ -257,6 +405,7 @@ python3 backend/skills/short-drama-produce/scripts/production_tool.py audit <项
   | `creator_markdown_check.py` | 五份文档的跨文档契约：编号引用、`出场设定`、`输入参考图`、首尾帧小节格式、连戏锁 | 引用了不存在的条目/镜号、首帧小节夹列表、`待补参考图` 残留 |
   | `backend/app/schemas.check_storyboards` | 本项目接口层的算术与镜数规则 | 各镜之和 ≠ 组时长、单镜过短、组超 15s、镜数越界 |
   | 单测 + `ruff` | 契约、分段、机检、技能装载 | 任一失败即阻断交付 |
+  | 出图闸门（`tests/unit/test_media*.py`） | 指纹绑定、确认码核销、`allow_paid` 拦截、额度熔断、同指纹幂等、路径越界、厂商名零泄漏 | 未确认就提交、同参数重复扣费、`providers/` 外出现厂商名 |
 - **离线评测集**：覆盖不同题材、长/短章节、多角色、无明确场景描写的边界样本；阈值写 `thresholds.yaml`。
 - 指标：台词零容错 100%、schema 通过率 100%、镜时长自洽率 100%、资产覆盖率 100%、角色/场景一致性（规则 + LLM-as-Judge 抽样 + 人工校准）、出片成功率与成片可用率、单 run 成本与耗时。
 - 能规则化的用规则，主观项用 LLM-as-Judge + 人工校准；**不靠「看着不错」上线**。改提示词 / 换模型 / 换切分策略 → 重跑全量评测对比基线，退化即回滚。
@@ -289,6 +438,7 @@ python3 backend/skills/short-drama-produce/scripts/production_tool.py audit <项
 6. 保持「可单独重跑」不变式；不删除 `.workbuddy/` 与运行目录历史产物（可归档，不可静默清理）。
 7. 交付前：`ruff check`、`unittest`、`creator_markdown_check.py` 全绿；改到提示词/模型再跑评测；不全绿不交付。
 8. 改了用户给的东西（章节、提示词、分镜），一条条列出改了哪几处。
+9. **优先成熟框架，少造轮子**：需要按 Agent 标准流程实现时，先确认是否有成熟通用框架覆盖（含项目已引入依赖，如 LangGraph / LangChain）；有就用它的原生抽象与推荐范式（编排、工具、中间件、流式等），不写一套替代实现。仅当框架确实不适用（能力缺失 / 契约冲突 / 引入成本明显过高）才自研，且只补缺口、不重写框架已有部分，并说明不采用框架的具体理由。这里的「标准流程」指社区成熟的 Agent 编排范式，不是项目私有流程。
 
 ## 11. 待确认事项（未拍板前用默认约定，别写死）
 

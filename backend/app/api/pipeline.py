@@ -1,17 +1,24 @@
+import json
+
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 from loguru import logger
+from starlette.concurrency import iterate_in_threadpool
 
 from ..core.config import settings
 from ..core.schemas import (
+    ArchiveReport,
     ExtractAssetsRequest,
     ExtractAssetsResponse,
     NovelPipelineRequest,
     NovelPipelineResponse,
+    ProgressEvent,
     SkillCatalogResponse,
     SkillInfo,
     chapter_output,
 )
-from ..generation.graph import run_novel_pipeline
+from ..generation.archive import archive_novel
+from ..generation.graph import PROGRESS, run_novel_pipeline, stream_novel_pipeline
 from ..generation.llm import extract_assets
 from ..knowledge.skills import catalog, load_all
 from ..observability.logging import get_request_id, new_request_id
@@ -109,15 +116,9 @@ def run(req: ExtractAssetsRequest):
     )
 
 
-@router.post("/generate-novel", response_model=NovelPipelineResponse)
-def run_novel(req: NovelPipelineRequest):
-    """小说名 + 多章原文 → LangGraph 逐章编排 → 按章五类产出。
-
-    章节边界由代码确定性识别并逐字回拼，模型不参与拆分；顺序由 StateGraph 的边决定，
-    不在各节点里写「自约束」前置检查。旧的单章 `/generate` 保持不动。
-    """
-    run_id = _run_id()
-    params = {
+def _novel_params(req: NovelPipelineRequest) -> dict:
+    """多章请求 → 图表参数；老端点与流式端点共用，避免两处漂移。"""
+    return {
         "character_hint": req.character_hint,
         "prop_hint": req.prop_hint,
         "scene_hint": req.scene_hint,
@@ -127,13 +128,24 @@ def run_novel(req: NovelPipelineRequest):
         "skills": list(req.skills),
         "scene_filter": list(req.scene_filter),
     }
-    final = run_novel_pipeline(
-        req.novel_title,
-        req.content,
-        params,
-        run_id=run_id,
-    )
 
+
+def _archive_final(final: dict, run_id: str) -> ArchiveReport:
+    """归档副作用：任何异常都只回告，不回滚生成、不抛 500。"""
+    try:
+        return archive_novel(final)
+    except Exception as exc:  # noqa: BLE001 - 归档是副作用，任何异常都不该拖垮已成功的生成
+        return ArchiveReport(
+            root="", novel_dir="", errors=[f"归档异常：{type(exc).__name__}: {exc}"]
+        )
+
+
+def _build_novel_response(final: dict, report: ArchiveReport, run_id: str) -> NovelPipelineResponse:
+    """final + 归档报告 → 响应契约；两条端点共用同一份组装逻辑。"""
+    if report.errors:
+        logger.bind(event="archive_degraded", run_id=run_id, errors=report.errors).warning(
+            "asset archive partially failed"
+        )
     logger.bind(
         event="novel_generation_done",
         status=200,
@@ -143,6 +155,7 @@ def run_novel(req: NovelPipelineRequest):
         agent_calls=final["total_agent_calls"],
         latency_ms=final["total_latency_ms"],
         gate_issues=final["gate_issue_count"],
+        archive_files=report.files_written,
     ).info("novel response ready")
     return NovelPipelineResponse(
         run_id=run_id,
@@ -160,4 +173,79 @@ def run_novel(req: NovelPipelineRequest):
         total_storyboards=final["total_storyboards"],
         injection_warning=final["injection_warning"],
         gate_issue_count=final["gate_issue_count"],
+        archive=report,
+    )
+
+
+def _sse(event: str, payload) -> str:
+    """一条 SSE 帧：event 名 + JSON data（ensure_ascii 便于中文直读）。"""
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+
+
+@router.post("/generate-novel", response_model=NovelPipelineResponse)
+def run_novel(req: NovelPipelineRequest):
+    """小说名 + 多章原文 → LangGraph 逐章编排 → 按章五类产出。
+
+    章节边界由代码确定性识别并逐字回拼，模型不参与拆分；顺序由 StateGraph 的边决定，
+    不在各节点里写「自约束」前置检查。旧的单章 `/generate` 保持不动。
+    """
+    run_id = _run_id()
+    final = run_novel_pipeline(
+        req.novel_title,
+        req.content,
+        _novel_params(req),
+        run_id=run_id,
+    )
+    report = _archive_final(final, run_id)
+    return _build_novel_response(final, report, run_id)
+
+
+@router.post("/generate-novel/stream")
+async def run_novel_stream(req: NovelPipelineRequest):
+    """与 `/generate-novel` 结果完全相同，但用 SSE 逐阶段回报进度。
+
+    事件顺序：若干 `progress`（阶段文案 + 步数）→ 一条 `done`（完整响应，与老端点同构）。
+    异常走 `error` 事件而非断连。生成节点是同步的，用 starlette 线程池包装迭代器，
+    避免阻塞事件循环；LangGraph 的进度事件依赖 contextvar，实测跨线程不丢失。
+    """
+
+    async def events():
+        run_id = _run_id()
+        try:
+            final = None
+            # 同步图在线程池里跑；iterate_in_threadpool 逐步产出 (kind, payload)。
+            async for kind, payload in iterate_in_threadpool(
+                stream_novel_pipeline(
+                    req.novel_title,
+                    req.content,
+                    _novel_params(req),
+                    run_id=run_id,
+                )
+            ):
+                if kind == "progress":
+                    yield _sse("progress", ProgressEvent(**payload).model_dump())
+                else:
+                    final = payload
+
+            if final is None:
+                raise RuntimeError("生成图未返回最终结果")
+
+            # 归档阶段在路由层（不在图节点内），单独报一条进度。
+            yield _sse(
+                "progress",
+                ProgressEvent(phase="archive", text=PROGRESS["archive_start"], step=0, total=0).model_dump(),
+            )
+            report = _archive_final(final, run_id)
+            response = _build_novel_response(final, report, run_id)
+            yield _sse("done", response.model_dump(mode="json"))
+        except Exception as exc:  # noqa: BLE001 - SSE 里用 error 事件回告，不能让连接无声断开
+            logger.bind(event="novel_stream_error", run_id=run_id, error=str(exc)).exception(
+                "novel stream failed"
+            )
+            yield _sse("error", {"message": f"{type(exc).__name__}: {exc}"})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
