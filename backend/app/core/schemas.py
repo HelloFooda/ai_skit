@@ -515,6 +515,10 @@ class MediaPreviewRequest(BaseModel):
 
     prompt_id: str = Field(description="提示词条目 id（清单里的 img-<category>-<hash8>）")
     seed: int | None = Field(default=None, description="固定种子；留空则每次不同")
+    reference_image_id: str = Field(
+        default="",
+        description="图生图参考图（同条目已落盘图片 id，如 mi-...）；空表示纯文生图",
+    )
 
 
 class MediaPreviewResponse(BaseModel):
@@ -536,6 +540,8 @@ class MediaPreviewResponse(BaseModel):
     ratio: str = ""
     seed: int | None = None
     n: int = 1
+    reference_image_id: str = Field(default="", description="本次绑定的参考图 id；空为纯文生图")
+    reference_image: dict | None = Field(default=None, description="参考图回显：id / label / path")
     state: str = Field(default="planned", description="planned / confirmed / submitted / done / failed")
     blocking: list[str] = Field(default_factory=list, description="非空表示现在提交必然失败")
     warnings: list[str] = Field(default_factory=list)
@@ -556,6 +562,35 @@ class MediaGenerateRequest(BaseModel):
 
     prompt_id: str
     confirmation: str = Field(description="预览返回的确认码，逐字回传")
+
+
+class MediaRefineRequest(BaseModel):
+    """POST /api/media/refine：用户追加描述 → LLM 补丁式融合，只出草案不落盘。"""
+
+    prompt_id: str
+    addition: str = Field(min_length=1, max_length=2000, description="用户追加的一句描述")
+    reference_image_id: str = Field(
+        default="", description="要迭代的已生成图 id（同条目旧版）；仅用于前端回显"
+    )
+
+
+class MediaRefineResponse(BaseModel):
+    """融合草案：diff 给人看，after_markdown 供用户确认后写回。"""
+
+    prompt_id: str
+    novel: str
+    title: str = ""
+    addition: str = ""
+    before_body: str = ""
+    after_body: str = ""
+    after_markdown: str = Field(description="确认后原样 PUT /api/assets/prompts/{id} 落盘")
+    diff: list[str] = Field(default_factory=list, description="unified diff 行，前端逐行渲染")
+    patches: list[dict] = Field(default_factory=list, description="LLM 实际输出的补丁，供回溯")
+    base_hash: str = ""
+    after_hash: str = ""
+    usage: dict = Field(default_factory=dict, description="本次 LLM token 用量")
+    prompt_version: str = ""
+    warnings: list[str] = Field(default_factory=list)
 
 
 class MediaImagesResponse(BaseModel):

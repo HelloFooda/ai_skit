@@ -33,8 +33,10 @@ from ..core.schemas import (
     MediaJobStatusResponse,
     MediaPreviewRequest,
     MediaPreviewResponse,
+    MediaRefineRequest,
+    MediaRefineResponse,
 )
-from ..media import service
+from ..media import refine, service
 from ..media.store import read_sidecar, resolve_image_file, select_image
 
 router = APIRouter(prefix="/api/media", tags=["media"])
@@ -47,7 +49,9 @@ def _sse(event: str, payload) -> str:
 @router.post("/preview", response_model=MediaPreviewResponse)
 def preview(req: MediaPreviewRequest):
     """算账不花钱：算指纹、给确认码、报阻塞项与今日额度。"""
-    result = service.preview(None, req.prompt_id, seed=req.seed)
+    result = service.preview(
+        None, req.prompt_id, seed=req.seed, reference_image_id=req.reference_image_id
+    )
     logger.bind(
         event="media_preview",
         job_id=result["job_id"],
@@ -55,6 +59,24 @@ def preview(req: MediaPreviewRequest):
         blocking=len(result["blocking"]),
         cached=bool(result["cached"]),
     ).info("media preview")
+    return result
+
+
+@router.post("/refine", response_model=MediaRefineResponse)
+def refine_prompt(req: MediaRefineRequest):
+    """追加描述 → LLM 补丁式融合成新正文草案。不落盘、不出图、不扣图费。
+
+    用户看到 diff 并确认后，前端把 `after_markdown` 原样 PUT 到
+    `/api/assets/prompts/{id}` 落盘；正文一改，出图确认码自动失效，
+    必须重新 preview 才能带新正文出图。
+    """
+    result = refine.draft(None, req.prompt_id, req.addition)
+    logger.bind(
+        event="media_refine_draft",
+        prompt_id=req.prompt_id,
+        patches=len(result["patches"]),
+        tokens=result["usage"].get("total_tokens", 0),
+    ).info("media refine draft")
     return result
 
 

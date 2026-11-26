@@ -9,9 +9,12 @@ import {
   getMediaSidecar,
   listMediaImages,
   previewMedia,
+  refineMedia,
+  saveAssetPrompt,
   selectMediaImage,
   type MediaImageRecord,
   type MediaPreview,
+  type MediaRefineDraft,
   type ProgressEvent,
 } from "./api";
 
@@ -26,6 +29,15 @@ export function useAssetMedia(notify?: (message: string) => void) {
   const mediaStep = ref("");
   const mediaSidecar = ref<Record<string, unknown> | null>(null);
   const lightbox = ref<MediaImageRecord | null>(null);
+
+  /** 图生图迭代：要迭代的旧图 + 用户追加描述 + LLM 融合草案 */
+  const refineSource = ref<MediaImageRecord | null>(null);
+  const refineAddition = ref("");
+  const refineDraft = ref<MediaRefineDraft | null>(null);
+  const refineLoading = ref(false);
+  const refineApplying = ref(false);
+  /** 本次出图绑定的参考图 id；preview / generate 都靠它算同一指纹 */
+  const activeReferenceId = ref("");
 
   /** 清单里的条目 → 该条目已出的图；一条目可有多版，selected 是当前版 */
   function imagesOf(promptId: string): MediaImageRecord[] {
@@ -63,7 +75,7 @@ export function useAssetMedia(notify?: (message: string) => void) {
     mediaSidecar.value = null;
     mediaLoading.value = true;
     try {
-      mediaPreview.value = await previewMedia(promptId);
+      mediaPreview.value = await previewMedia(promptId, null, activeReferenceId.value);
     } catch (e: unknown) {
       mediaError.value = e instanceof Error ? e.message : String(e);
     } finally {
@@ -117,10 +129,94 @@ export function useAssetMedia(notify?: (message: string) => void) {
     }
   }
 
-  /** 切回某一版：同条目其它版本自动取消选用，旧图不删 */
+  /** 打开迭代：以某一张已出图为参考，填追加描述重新出图 */
+  function startRefine(image: MediaImageRecord) {
+    refineSource.value = image;
+    refineAddition.value = "";
+    refineDraft.value = null;
+    mediaError.value = "";
+  }
+
+  /** 第一步：追加描述 → LLM 补丁式融合，只出草案，不落盘不出图 */
+  async function buildRefineDraft() {
+    const source = refineSource.value;
+    if (!source || !refineAddition.value.trim() || refineLoading.value) return;
+    refineLoading.value = true;
+    mediaError.value = "";
+    refineDraft.value = null;
+    try {
+      refineDraft.value = await refineMedia(
+        source.prompt_id,
+        refineAddition.value.trim(),
+        source.id,
+      );
+    } catch (e: unknown) {
+      mediaError.value = e instanceof Error ? e.message : String(e);
+    } finally {
+      refineLoading.value = false;
+    }
+  }
+
+  /**
+   * 第二步：用户看过 diff 确认后，把融合正文原样写回，再带这张旧图重新预览。
+   * 正文一改指纹就变，旧确认码自动失效——新确认码来自这里的新 preview。
+   */
+  async function applyRefine() {
+    const draft = refineDraft.value;
+    const source = refineSource.value;
+    if (!draft || !source || refineApplying.value) return;
+    refineApplying.value = true;
+    mediaError.value = "";
+    mediaStep.value = "写回正文并重新算账…";
+    try {
+      await saveAssetPrompt(draft.prompt_id, draft.after_markdown);
+      activeReferenceId.value = source.id;
+      mediaPreview.value = await previewMedia(draft.prompt_id, null, source.id);
+      // 草案已兑现，收起迭代面板；确认抽屉里显示的是融合后正文 + 参考图的新账
+      refineDraft.value = null;
+      refineSource.value = null;
+      refineAddition.value = "";
+      mediaStep.value = "";
+      notify?.("正文已更新，确认后即以原图为参考出新版");
+    } catch (e: unknown) {
+      mediaError.value = e instanceof Error ? e.message : String(e);
+      mediaStep.value = "";
+    } finally {
+      refineApplying.value = false;
+    }
+  }
+
+  function closeRefine() {
+    refineSource.value = null;
+    refineAddition.value = "";
+    refineDraft.value = null;
+  }
+
+  /**
+   * 切回某一版：同条目其它版本自动取消选用，旧图不删。
+   * 三处 selected 标记必须一起改——预览抽屉 / 详情画廊 / 大图各自读不同的副本，
+   * 只 reload 列表会让当前选中框看起来"点了没反应"。
+   */
   async function pickImage(image: MediaImageRecord, novel: string) {
     try {
       await selectMediaImage(image.id);
+      const mark = (item: MediaImageRecord) => ({
+        ...item,
+        selected: item.id === image.id,
+      });
+      imagesByPrompt.value = {
+        ...imagesByPrompt.value,
+        [image.prompt_id]: (imagesByPrompt.value[image.prompt_id] ?? []).map(mark),
+      };
+      if (mediaPreview.value?.prompt_id === image.prompt_id) {
+        mediaPreview.value = {
+          ...mediaPreview.value,
+          images: mediaPreview.value.images.map(mark),
+        };
+      }
+      if (lightbox.value?.prompt_id === image.prompt_id) {
+        lightbox.value = mark(lightbox.value);
+      }
       await loadImages(novel);
       notify?.(`已选用 v${image.version}`);
     } catch (e: unknown) {
@@ -142,6 +238,8 @@ export function useAssetMedia(notify?: (message: string) => void) {
     mediaPreview.value = null;
     mediaError.value = "";
     mediaStep.value = "";
+    activeReferenceId.value = "";
+    closeRefine();
   }
 
   return {
@@ -153,11 +251,21 @@ export function useAssetMedia(notify?: (message: string) => void) {
     mediaStep,
     mediaSidecar,
     lightbox,
+    refineSource,
+    refineAddition,
+    refineDraft,
+    refineLoading,
+    refineApplying,
+    activeReferenceId,
     imagesOf,
     currentImage,
     loadImages,
     openMedia,
     confirmMedia,
+    startRefine,
+    buildRefineDraft,
+    applyRefine,
+    closeRefine,
     pickImage,
     showSidecar,
     closeMedia,

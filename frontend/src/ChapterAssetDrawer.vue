@@ -22,6 +22,7 @@ import {
   type PromptStatus,
 } from "./api";
 import { useAssetMedia } from "./useAssetMedia";
+import RefineDrawer from "./RefineDrawer.vue";
 
 const props = defineProps<{
   open: boolean;
@@ -53,11 +54,20 @@ const {
   mediaStep,
   mediaSidecar,
   lightbox,
+  refineSource,
+  refineAddition,
+  refineDraft,
+  refineLoading,
+  refineApplying,
   imagesOf,
   currentImage,
   loadImages,
   openMedia,
   confirmMedia,
+  startRefine,
+  buildRefineDraft,
+  applyRefine,
+  closeRefine,
   pickImage,
   showSidecar,
   closeMedia,
@@ -428,17 +438,19 @@ async function openDocFile(path: string, name: string) {
         <div v-if="mediaPreview.images.length" class="versions">
           <p class="group-title">已出 {{ mediaPreview.images.length }} 版（点选切换当前版）</p>
           <div class="version-strip">
-            <button
-              v-for="image in mediaPreview.images"
-              :key="image.id"
-              class="version-item"
-              :class="{ active: image.selected }"
-              :title="`v${image.version} · ${image.provider} · ${image.created_at}`"
-              @click="pickImage(image, novel)"
-            >
-              <img :src="mediaFileUrl(novel, image.path)" :alt="`v${image.version}`" />
-              <span class="version-tag">v{{ image.version }}</span>
-            </button>
+            <div v-for="image in mediaPreview.images" :key="image.id" class="version-cell">
+              <button
+                class="version-item"
+                :class="{ active: image.selected }"
+                :title="`v${image.version} · ${image.provider} · ${image.created_at}`"
+                @click="pickImage(image, novel)"
+              >
+                <img :src="mediaFileUrl(novel, image.path)" :alt="`v${image.version}`" />
+                <span class="version-tag">v{{ image.version }}</span>
+                <span v-if="image.selected" class="picked">✓</span>
+              </button>
+              <button class="refine-btn" @click="startRefine(image)">迭代</button>
+            </div>
           </div>
         </div>
         <div class="drawer-actions">
@@ -528,6 +540,21 @@ async function openDocFile(path: string, name: string) {
       <p v-else class="muted small">读取中…</p>
     </aside>
   </div>
+
+  <!-- 图生图迭代：以已出图为参考，追加描述融合进正文后重出 -->
+  <RefineDrawer
+    :novel="novel"
+    :source="refineSource"
+    :addition="refineAddition"
+    :draft="refineDraft"
+    :loading="refineLoading"
+    :applying="refineApplying"
+    :error="mediaError"
+    @close="closeRefine"
+    @update:addition="refineAddition = $event"
+    @build="buildRefineDraft"
+    @apply="applyRefine"
+  />
 </template>
 
 <style scoped>
@@ -708,6 +735,8 @@ button.link {
 .facts .on { color: var(--danger-soft-fg); font-weight: 600; }
 .facts .off { color: var(--success); }
 .version-strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+.version-cell { flex: none; display: flex; flex-direction: column; gap: 4px; align-items: center; }
+.refine-btn { padding: 2px 8px; font-size: 11px; line-height: 1.4; }
 .version-item {
   flex: none;
   width: 82px;
@@ -720,7 +749,13 @@ button.link {
   position: relative;
 }
 .version-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.version-item.active { border-color: var(--accent); }
+.version-item.active { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.version-item:hover { border-color: var(--accent); }
+.picked {
+  position: absolute; right: 3px; top: 3px; width: 17px; height: 17px; line-height: 17px;
+  text-align: center; border-radius: 50%; font-size: 11px; font-weight: 700;
+  background: var(--accent); color: var(--accent-contrast);
+}
 .version-tag {
   position: absolute;
   left: 3px;

@@ -238,6 +238,28 @@ def _locate(root: str | Path | None, image_id: str) -> tuple[str, Any, MediaImag
     raise ImageNotFound(f"未找到图片：{image_id}")
 
 
+def resolve_reference_image(
+    root: str | Path | None, image_id: str, *, prompt_id: str
+) -> tuple[Path, MediaImageRecord]:
+    """把已落盘的图片 id 解析成可当参考图的绝对路径。
+
+    只接受**同条目**的旧版本：新图仍属同一 `IMG-...` 条目，拿 A 角色的图去改 B 角色
+    的描述是张冠李戴，直接拒绝。路径经 `_locate`（清单登记）+ 小说目录拼接，不信任
+    前端传来的任何路径片段。
+    """
+    if not image_id:
+        raise ImageNotFound("参考图 id 不能为空")
+    novel, _, record = _locate(root, image_id)
+    if record.prompt_id != prompt_id:
+        raise ImagePathRejected(
+            f"参考图 {image_id} 属于条目 {record.prompt_id}，不能用于 {prompt_id}"
+        )
+    path = (novel_dir(root, novel) / record.path).resolve()
+    if not path.is_file():
+        raise ImageNotFound(f"参考图文件不存在：{record.path}")
+    return path, record
+
+
 def resolve_image_file(root: str | Path | None, novel: str, relative: str) -> Path:
     """`GET /api/media/file` 的路径校验：必须在小说目录内、后缀合法、文件存在。"""
     base = novel_dir(root, novel)

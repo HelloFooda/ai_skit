@@ -31,7 +31,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from ..generation.asset_store import novel_dir, resolve_root
-from .contract import MediaRef, MediaRequest, RefRole, sanitize_detail
+from .contract import MediaRef, MediaRequest, sanitize_detail
 from .settings import settings
 
 JobState = Literal["planned", "confirmed", "submitted", "done", "failed", "collected"]
@@ -326,7 +326,8 @@ def to_request(job: MediaJob, prompt: str) -> MediaRequest:
         prompt=prompt,
         refs=[
             MediaRef(
-                role=RefRole(ref["role"]),
+                # role 是 Literal 别名，不能当函数调用；交给 pydantic 校验取值。
+                role=ref["role"],
                 path=Path(ref["path"]),
                 label=str(ref.get("label") or ""),
             )

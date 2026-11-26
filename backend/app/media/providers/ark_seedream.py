@@ -234,7 +234,10 @@ class ArkSeedreamProvider:
         }
         if request.refs:
             # 参考图必须是公网可访问 URL 或 base64；本地文件走 data URL。
-            payload["image"] = [self._data_url(Path(ref.path)) for ref in request.refs]
+            # 必须塞进 extra_body：openai SDK 的 Images.generate() 没有 image 形参，
+            # 直接放 payload 会报 "unexpected keyword argument 'image'"。
+            # extra_body 会被 SDK 合并到请求体顶层，等价于方舟要求的 image 字段。
+            extra["image"] = [self._data_url(Path(ref.path)) for ref in request.refs]
 
         started = time.monotonic()
         try:

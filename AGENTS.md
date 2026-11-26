@@ -159,6 +159,35 @@
   LLM 调用；套 StateGraph 也只是把线性三步画成图，而确认码是**人**的动作、不是图的状态转移。
   批量编排与 `interrupt()` 人工确认留到多条目批量阶段再上图。
 
+##### 图生图迭代（对已出图不满意，`app/media/refine.py`）
+
+用户对某张已出图不满意时，走「以旧图为参考 + 追加描述重出一张」，**不删旧图**。链路：
+`选旧版 → 追加描述 → LLM 补丁式融合 → 展示 diff 用户确认 → 写回正文 → 带参考图 preview → confirm → generate`。
+这一步是 S3→S7 之间的支线，不新增事实源、不改三步协议。
+
+- **融合在出图前，不在出图后**：追加描述先由 LLM 融进 IMG 正文，融合后的正文既当出图 prompt
+  也落盘存档——「存档描述」与「这张图的生成依据」必须是同一份，否则无法按同条件重跑。
+  用户写一个"想改什么"的短句即可，不必重打完整描述；图片按张计费，prompt 长短不影响费用。
+- **补丁式，不重写**：`POST /api/media/refine` 只让 LLM 输出锚点补丁（`append_after` / `replace`
+  / `prepend_before`），业务层应用到原文，anchor 必须逐字出现且唯一，其余字节不动。
+  受保护锚点（三区域分栏的 `上部/下部/左主区/右子区/占高/占宽/几分之几`、`LOCK-...`、
+  画幅比例、`三视图/头肩特写/细节区/关键结构`）融合前后必须逐字等量保留，否则打回。
+  这类硬约束要改请手动编辑正文，不交给 LLM 猜。
+- **两步才算确认**：`refine` 只出草案（diff + `after_markdown`），**不落盘、不出图、不扣图费**；
+  用户过目后把 `after_markdown` 原样 `PUT /api/assets/prompts/{id}` 写回。正文 hash 一变，
+  出图旧确认码自动失效，必须重新 preview 拿新码。
+- **参考图只管视觉一致**：`reference_image_id` 取同条目已落盘图片 id（`mi-...`），由
+  `store.resolve_reference_image` 校验同条目、解析路径，再绑定为 `MediaRef(role="reference_image")`。
+  跨条目引用直接拒绝；provider 拿它保长相/风格/构图，版式与结构约束仍由完整正文负责。
+- **参考图的 SDK 落点**：openai SDK 的 `Images.generate()` 没有 `image` 形参，厂商专有字段
+  （参考图 / `watermark` / `seed`）一律走 `extra_body`，SDK 会合并到请求体顶层。
+  禁止把 `image` 放进顶层 kwargs——本地 mock 接受任意参数不会报错，但真实调用会抛
+  `unexpected keyword argument 'image'`。测试须对账真实 SDK 签名。
+- **提交阶段以预览记录为准**：`generate_stream` 的 refs 从落盘 `job.refs` 恢复，不信任提交时再传的参数；
+  想换参考图必须重新 preview——与"改正文旧码失效"同一套闸门，防止绕过确认。
+- **追加描述是不可信素材**：包在 `<user_addition>` 拼进 user 消息，不进模板引擎；system 规则是固定字符串。
+  注入探测只报 warning，不改写不阻断。LLM 走 `generation/chains` 的 LCEL 链，token 按 stage 归因。
+
 ### S8 交付与归档
 
 - 按镜序合成 `制作成果/成片/`（首版只做顺序拼接 + 简单转场，剪辑单落 `剪辑单.md`）。
@@ -319,8 +348,9 @@ ai_skit/
 │   │   │   ├── contract.py      # MediaProvider 端口、MediaRequest/Capabilities/MediaResult、错误分类
 │   │   │   ├── settings.py      # MEDIA_* 配置（独立前缀，不认识具体厂商）
 │   │   │   ├── jobs.py          # 指纹、确认码、任务状态机、日额度账本（_media/）
-│   │   │   ├── store.py         # 图片落盘：图片/<条目>-vN.png + sidecar + manifest.images[]
-│   │   │   ├── service.py       # preview / generate_stream / collect（三步协议的业务实现）
+│   │   │   ├── store.py         # 图片落盘：图片/<条目>-vN.png + sidecar + manifest.images[] + resolve_reference_image
+│   │   │   ├── service.py       # preview / generate_stream / collect（三步协议的业务实现，refs 从预览记录恢复）
+│   │   │   ├── refine.py        # 图生图迭代：LLM 补丁式融合 + 受保护锚点校验 + diff（草案不落盘）
 │   │   │   └── providers/       # ★ 唯一允许出现厂商名的地方：fixture（离线）/ ark（真实）
 │   │   └── knowledge/           # 知识层：skills.py（SKILL.md + references 加载）
 │   ├── skills/                  # ★ 技能包（12 个 short-drama-*，不改内容）

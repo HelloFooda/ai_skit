@@ -18,6 +18,7 @@ import {
   type PromptStatus,
 } from "./api";
 import { useAssetMedia } from "./useAssetMedia";
+import RefineDrawer from "./RefineDrawer.vue";
 
 const props = withDefaults(defineProps<{ preferNovel?: string }>(), { preferNovel: "" });
 
@@ -53,11 +54,20 @@ const {
   mediaStep,
   mediaSidecar,
   lightbox,
+  refineSource,
+  refineAddition,
+  refineDraft,
+  refineLoading,
+  refineApplying,
   imagesOf,
   currentImage,
   loadImages,
   openMedia,
   confirmMedia,
+  startRefine,
+  buildRefineDraft,
+  applyRefine,
+  closeRefine,
   pickImage,
   showSidecar,
   closeMedia,
@@ -273,7 +283,22 @@ function close() {
   openId.value = "";
   detail.value = null;
   openDoc.value = null;
+  lightbox.value = null;
+  closeMedia();
 }
+
+// 迭代写回正文后，详情里的提示词编辑器要跟着刷新，否则用户看到的是旧正文。
+// 只更新详情数据、不重建抽屉，避免详情闪一下消失。
+watch(refineApplying, async (now, was) => {
+  if (!was || now || !openId.value) return;
+  try {
+    const latest = await getAssetPrompt(openId.value);
+    detail.value = latest;
+    draft.value = latest.body;
+  } catch {
+    // 详情刷新失败不影响已经写回的正文，下次打开会重新读
+  }
+});
 
 async function refreshList() {
   await loadNovels(selectedNovel.value);
@@ -333,12 +358,6 @@ async function copy(text: string, key: string) {
   } catch {
     notice.value = "复制失败，请手动选中文本";
   }
-}
-
-/** 资产库打开出图抽屉时，先关掉章节文档抽屉，避免两个抽屉叠着显示 */
-function openMediaFromLibrary(promptId: string) {
-  openDoc.value = null;
-  void openMedia(promptId);
 }
 
 defineExpose({ loadNovels });
@@ -419,12 +438,12 @@ defineExpose({ loadNovels });
                 </span>
               </span>
             </button>
-            <!-- 缩略图：已有图就显示当前选用版，点开大图；没有就显示「出图」入口 -->
+            <!-- 缩略图：点进条目详情，提示词 / 全部版本 / 迭代入口都在同一页 -->
             <button
               v-if="currentImage(item.entry.id)"
               class="thumb"
-              :title="`查看 ${item.dir} 第 ${currentImage(item.entry.id)!.version} 版`"
-              @click="lightbox = currentImage(item.entry.id)"
+              :title="`打开 ${item.dir} 详情（含提示词与已出图）`"
+              @click="open(item.entry.id)"
             >
               <img
                 :src="mediaFileUrl(selectedNovel, currentImage(item.entry.id)!.path)"
@@ -432,14 +451,6 @@ defineExpose({ loadNovels });
                 loading="lazy"
               />
               <span class="thumb-badge">v{{ currentImage(item.entry.id)!.version }}</span>
-            </button>
-            <button
-              class="ghost gen-btn"
-              :disabled="mediaBusy"
-              :title="imagesOf(item.entry.id).length ? '再出一版（旧版保留）' : '生成设定图'"
-              @click="openMediaFromLibrary(item.entry.id)"
-            >
-              {{ imagesOf(item.entry.id).length ? "再出图" : "出图" }}
             </button>
           </div>
           <button
@@ -464,8 +475,9 @@ defineExpose({ loadNovels });
       共 {{ totalShown }} 份文档 · 路径：<code>assets/{{ selectedNovel }}/&lt;分类&gt;/&lt;条目名&gt;/</code>
     </p>
 
-    <div v-if="openId && detail" class="drawer-mask" @click.self="close">
-      <aside class="drawer">
+    <!-- 条目详情：提示词 + 已出图 + 选版 + 迭代 + 算账确认，集中在一页 -->
+    <div v-if="openId && detail" class="drawer-mask detail-mask" @click.self="close">
+      <aside class="drawer detail-drawer">
         <div class="drawer-head">
           <div>
             <b>{{ detail.asset_name }}</b>
@@ -481,144 +493,153 @@ defineExpose({ loadNovels });
         </p>
         <p v-if="notice" class="notice">{{ notice }}</p>
 
-        <div class="editor-head">
-          <span>可复制提示词（Markdown）</span>
-          <span class="actions-mini">
-            <button class="ghost" :disabled="saving" @click="copy(draft, '提示词')">复制</button>
-            <button
-              v-if="detail.generated_body"
-              class="ghost"
-              @click="showCompare = !showCompare"
-            >
-              {{ showCompare ? "收起对照" : "看模板对照" }}
-            </button>
-          </span>
-        </div>
-        <textarea v-model="draft" class="editor" rows="18" spellcheck="false"></textarea>
-
-        <div v-if="showCompare && detail.generated_body" class="compare">
-          <p class="muted small">模板最新版本（重跑生成时因你已编辑而未覆盖主文件）：</p>
-          <pre>{{ detail.generated_body }}</pre>
-          <button class="ghost" :disabled="saving" @click="regenerate">采用模板版本</button>
-        </div>
-
-        <div class="drawer-actions">
-          <button :disabled="saving || draft === detail.body" @click="save">保存编辑</button>
-          <button
-            :disabled="saving || detail.status !== 'edited'"
-            @click="approve"
-          >
-            定稿
-          </button>
-        </div>
-      </aside>
-    </div>
-
-    <!-- 出图确认抽屉：先看账（指纹/额度/阻塞项），点确认才提交 -->
-    <div v-if="mediaPreview || mediaLoading" class="drawer-mask" @click.self="closeMedia">
-      <aside class="drawer">
-        <div class="drawer-head">
-          <div>
-            <b>{{ mediaPreview?.title || "生成设定图" }}</b>
-            <span class="muted small"> · {{ mediaPreview?.img_id }}</span>
-          </div>
-          <button class="ghost" :disabled="mediaBusy" @click="closeMedia">关闭</button>
-        </div>
-
-        <p v-if="mediaLoading" class="muted small">正在算账…</p>
-        <p v-if="mediaError" class="err">{{ mediaError }}</p>
-        <p v-if="mediaStep" class="notice">{{ mediaStep }}</p>
-
-        <template v-if="mediaPreview">
-          <!-- 阻塞项优先：现在提交必然失败，先说清楚为什么 -->
-          <div v-if="mediaPreview.blocking.length" class="block-box">
-            <b>现在不能提交：</b>
-            <ul>
-              <li v-for="(reason, i) in mediaPreview.blocking" :key="i">{{ reason }}</li>
-            </ul>
-          </div>
-          <p v-for="(warn, i) in mediaPreview.warnings" :key="`w${i}`" class="warn-line">
-            ⚠ {{ warn }}
-          </p>
-
-          <div v-if="mediaPreview.cached" class="cache-box">
-            同参数已有成品（v{{ mediaPreview.cached.version }}），确认后不会重复扣费。
-          </div>
-          <p v-if="mediaPreview.prompt_stale" class="warn-line">
-            ⚠ 提示词在上次出图后改过，当前图不代表最新提示词。
-          </p>
-
-          <dl class="facts">
-            <dt>厂商 / 模型</dt>
-            <dd>{{ mediaPreview.provider }} · {{ mediaPreview.model || "（默认）" }}</dd>
-            <dt>画幅</dt>
-            <dd>{{ mediaPreview.size }} · {{ mediaPreview.ratio }} · 1 张</dd>
-            <dt>提示词</dt>
-            <dd>{{ mediaPreview.prompt_chars }} 字</dd>
-            <dt>预估成本</dt>
-            <dd>
-              <template v-if="mediaPreview.cost_estimate !== null">
-                {{ mediaPreview.cost_estimate }}
-              </template>
-              <template v-else>未配置（MEDIA_COST_PER_IMAGE）</template>
-            </dd>
-            <dt>今日额度</dt>
-            <dd>
-              <template v-if="mediaPreview.quota.quota">
-                已提交 {{ mediaPreview.quota.submitted }} / {{ mediaPreview.quota.quota }}
-              </template>
-              <template v-else>不限（已提交 {{ mediaPreview.quota.submitted }} 次）</template>
-            </dd>
-            <dt>付费开关</dt>
-            <dd>
-              <span :class="mediaPreview.allow_paid ? 'on' : 'off'">
-                {{ mediaPreview.allow_paid ? "已开启（会真实计费）" : "已关闭（只允许离线 fixture）" }}
+        <div class="detail-grid">
+          <!-- 左：提示词编辑 / 定稿 -->
+          <section class="detail-col">
+            <div class="editor-head">
+              <span>可复制提示词（Markdown）</span>
+              <span class="actions-mini">
+                <button class="ghost" :disabled="saving" @click="copy(draft, '提示词')">复制</button>
+                <button
+                  v-if="detail.generated_body"
+                  class="ghost"
+                  @click="showCompare = !showCompare"
+                >
+                  {{ showCompare ? "收起对照" : "看模板对照" }}
+                </button>
               </span>
-            </dd>
-          </dl>
+            </div>
+            <textarea v-model="draft" class="editor" rows="14" spellcheck="false"></textarea>
 
-          <div class="confirm-box">
-            <p class="muted small">
-              确认码绑定当前指纹；改了提示词或任何参数，这张码立刻失效，需要重新预览。
-            </p>
-            <code class="confirm-code">{{ mediaPreview.confirmation }}</code>
-          </div>
+            <div v-if="showCompare && detail.generated_body" class="compare">
+              <p class="muted small">模板最新版本（重跑生成时因你已编辑而未覆盖主文件）：</p>
+              <pre>{{ detail.generated_body }}</pre>
+              <button class="ghost" :disabled="saving" @click="regenerate">采用模板版本</button>
+            </div>
 
-          <!-- 已出的版本：点一下切换当前选用版，旧图不删 -->
-          <div v-if="mediaPreview.images.length" class="versions">
-            <p class="editor-head">已出 {{ mediaPreview.images.length }} 版（点选切换当前版）</p>
-            <div class="version-strip">
-              <button
-                v-for="image in mediaPreview.images"
-                :key="image.id"
-                class="version-item"
-                :class="{ active: image.selected }"
-                :title="`v${image.version} · ${image.provider} · ${image.created_at}`"
-                @click="pickImage(image, selectedNovel)"
-              >
-                <img :src="mediaFileUrl(selectedNovel, image.path)" :alt="`v${image.version}`" />
-                <span class="version-tag">v{{ image.version }}</span>
+            <div class="drawer-actions">
+              <button :disabled="saving || draft === detail.body" @click="save">保存编辑</button>
+              <button :disabled="saving || detail.status !== 'edited'" @click="approve">
+                定稿
               </button>
             </div>
-          </div>
+          </section>
 
-          <div class="drawer-actions">
+          <!-- 右：设定图 Gallery + 算账确认，不跳第二个抽屉 -->
+          <section class="detail-col">
+            <div class="editor-head">
+              <span>设定图 · 已出 {{ imagesOf(openId).length }} 版</span>
+              <button class="ghost small-btn" :disabled="mediaBusy" @click="openMedia(openId)">
+                {{ imagesOf(openId).length ? "再出图" : "出图" }}
+              </button>
+            </div>
+
             <button
-              :disabled="mediaBusy || !!mediaPreview.blocking.length"
-              @click="confirmMedia(selectedNovel)"
+              v-if="currentImage(openId)"
+              class="detail-hero"
+              title="看大图与技术档案"
+              @click="lightbox = currentImage(openId)"
             >
-              {{ mediaBusy ? "生成中…" : mediaPreview.cached ? "确认（复用已有）" : "确认并生成" }}
+              <img
+                :src="mediaFileUrl(selectedNovel, currentImage(openId)!.path)"
+                :alt="`${detail.asset_name} 当前版`"
+              />
+              <span class="hero-tag">v{{ currentImage(openId)!.version }} · 当前版</span>
             </button>
-            <button class="ghost" :disabled="mediaBusy" @click="openMedia(mediaPreview.prompt_id)">
-              重新预览
-            </button>
-          </div>
-        </template>
+            <p v-else class="muted small no-image">还没有设定图。出图后可在这里选版或迭代。</p>
+
+            <div v-if="imagesOf(openId).length" class="versions">
+              <p class="muted small">点图设为当前版；点「迭代」以该版为参考图生图</p>
+              <div class="version-strip">
+                <div v-for="image in imagesOf(openId)" :key="image.id" class="version-cell">
+                  <button
+                    class="version-item"
+                    :class="{ active: image.selected }"
+                    :title="`v${image.version} · ${image.provider} · ${image.created_at}`"
+                    @click="pickImage(image, selectedNovel)"
+                  >
+                    <img :src="mediaFileUrl(selectedNovel, image.path)" :alt="`v${image.version}`" />
+                    <span class="version-tag">v{{ image.version }}</span>
+                    <span v-if="image.selected" class="picked">✓</span>
+                  </button>
+                  <button class="refine-btn" @click="startRefine(image)">迭代</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 算账结果内联：确认码绑定当前指纹；改正文或换参考图都会失效 -->
+            <div
+              v-if="mediaPreview ? mediaPreview.prompt_id === openId : mediaLoading"
+              class="inline-preview"
+            >
+              <p class="editor-head">本次出图（确认才扣费）</p>
+              <p v-if="mediaLoading" class="muted small">正在算账…</p>
+              <p v-if="mediaError" class="err">{{ mediaError }}</p>
+              <p v-if="mediaStep" class="notice">{{ mediaStep }}</p>
+              <div v-if="mediaPreview?.blocking.length" class="block-box">
+                <b>现在不能提交：</b>
+                <ul>
+                  <li v-for="(reason, i) in mediaPreview.blocking" :key="i">{{ reason }}</li>
+                </ul>
+              </div>
+              <p v-for="(warn, i) in mediaPreview?.warnings" :key="`w${i}`" class="warn-line">
+                ⚠ {{ warn }}
+              </p>
+              <div v-if="mediaPreview?.cached" class="cache-box">
+                同参数已有成品（v{{ mediaPreview.cached.version }}），确认后不会重复扣费。
+              </div>
+              <p v-if="mediaPreview?.reference_image" class="cache-box">
+                参考图：v{{ mediaPreview.reference_image.label?.split(':v')[1] || "已选" }} ·
+                以图生图方式重出
+              </p>
+              <p v-if="mediaPreview?.prompt_stale" class="warn-line">
+                ⚠ 提示词在上次出图后改过，当前图不代表最新提示词。
+              </p>
+              <dl v-if="mediaPreview" class="facts">
+                <dt>厂商 / 模型</dt>
+                <dd>{{ mediaPreview.provider }} · {{ mediaPreview.model || "（默认）" }}</dd>
+                <dt>画幅</dt>
+                <dd>{{ mediaPreview.size }} · {{ mediaPreview.ratio }} · 1 张</dd>
+                <dt>提示词</dt>
+                <dd>{{ mediaPreview.prompt_chars }} 字</dd>
+                <dt>预估成本</dt>
+                <dd>
+                  <template v-if="mediaPreview.cost_estimate !== null">
+                    {{ mediaPreview.cost_estimate }}
+                  </template>
+                  <template v-else>未配置（MEDIA_COST_PER_IMAGE）</template>
+                </dd>
+                <dt>今日额度</dt>
+                <dd>
+                  <template v-if="mediaPreview.quota.quota">
+                    已提交 {{ mediaPreview.quota.submitted }} / {{ mediaPreview.quota.quota }}
+                  </template>
+                  <template v-else>不限（已提交 {{ mediaPreview.quota.submitted }} 次）</template>
+                </dd>
+              </dl>
+              <div v-if="mediaPreview" class="confirm-box">
+                <p class="muted small">确认码绑定当前指纹；改了提示词或参数就失效。</p>
+                <code class="confirm-code">{{ mediaPreview.confirmation }}</code>
+              </div>
+              <div v-if="mediaPreview" class="drawer-actions">
+                <button
+                  :disabled="mediaBusy || !!mediaPreview.blocking.length"
+                  @click="confirmMedia(selectedNovel)"
+                >
+                  {{ mediaBusy ? "生成中…" : mediaPreview.cached ? "确认（复用已有）" : "确认并生成" }}
+                </button>
+                <button class="ghost" :disabled="mediaBusy" @click="openMedia(openId)">
+                  重新预览
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
       </aside>
     </div>
 
-    <!-- 大图：看细节与 sidecar -->
-    <div v-if="lightbox" class="drawer-mask" @click.self="lightbox = null">
+    <!-- 大图：看细节与 sidecar（层级须高于详情抽屉） -->
+    <div v-if="lightbox" class="drawer-mask lightbox-mask" @click.self="lightbox = null">
       <aside class="drawer">
         <div class="drawer-head">
           <div>
@@ -680,6 +701,21 @@ defineExpose({ loadNovels });
         <p v-else class="muted small">读取中…</p>
       </aside>
     </div>
+
+    <!-- 图生图迭代：以已出图为参考，追加描述融合进正文后重出 -->
+    <RefineDrawer
+      :novel="selectedNovel"
+      :source="refineSource"
+      :addition="refineAddition"
+      :draft="refineDraft"
+      :loading="refineLoading"
+      :applying="refineApplying"
+      :error="mediaError"
+      @close="closeRefine"
+      @update:addition="refineAddition = $event"
+      @build="buildRefineDraft"
+      @apply="applyRefine"
+    />
   </section>
 </template>
 
@@ -781,6 +817,44 @@ button.ghost { background: var(--bg); color: var(--accent); border: 1px solid va
 }
 .drawer-actions { display: flex; gap: 10px; margin-top: 16px; }
 
+/* ---- 条目详情：提示词 + 图片 + 迭代集中在一页 ---- */
+.drawer-mask.detail-mask { z-index: 25; justify-content: center; align-items: center; }
+.drawer-mask.lightbox-mask { z-index: 60; }
+.drawer.detail-drawer {
+  width: min(1180px, 95vw);
+  height: min(92vh, 980px);
+  box-sizing: border-box;
+  border-radius: 14px;
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+  margin-top: 12px;
+}
+.detail-col { min-width: 0; overflow-y: auto; padding-right: 6px; }
+.small-btn { padding: 5px 10px; font-size: 12px; }
+.detail-hero {
+  display: block; width: 100%; padding: 0; margin: 8px 0 4px; position: relative;
+  border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+  background: var(--bg-inset); cursor: zoom-in;
+}
+.detail-hero img { display: block; width: 100%; max-height: 34vh; object-fit: contain; }
+.hero-tag {
+  position: absolute; right: 8px; bottom: 8px; font-size: 11px; padding: 3px 7px;
+  border-radius: 6px; background: var(--accent); color: var(--accent-contrast);
+}
+.no-image {
+  padding: 26px 12px; text-align: center; border: 1px dashed var(--border);
+  border-radius: 12px; margin: 8px 0;
+}
+.inline-preview {
+  margin-top: 16px; padding: 12px 14px; border: 1px solid var(--border);
+  border-radius: 12px; background: var(--bg-subtle);
+}
+.inline-preview .editor-head:first-child { margin-top: 0; }
+.inline-preview .drawer-actions { margin-top: 12px; }
+
 /* ---- 出图：缩略图 / 版本条 / 确认抽屉 ---- */
 .entry-row { display: flex; align-items: center; gap: 8px; }
 .entry-row .entry-btn { flex: 1 1 auto; min-width: 0; }
@@ -795,7 +869,6 @@ button.ghost { background: var(--bg); color: var(--accent); border: 1px solid va
   position: absolute; right: 1px; bottom: 1px; font-size: 9px; line-height: 1;
   padding: 2px 3px; border-radius: 4px; background: var(--accent); color: var(--accent-contrast);
 }
-.gen-btn { flex: none; padding: 6px 11px; font-size: 12px; }
 .block-box {
   background: var(--danger-soft); border-radius: 10px; padding: 11px 13px; margin: 10px 0;
   font-size: 12.5px; color: var(--danger-soft-fg);
@@ -817,15 +890,29 @@ button.ghost { background: var(--bg); color: var(--accent); border: 1px solid va
 }
 .versions { margin-top: 16px; }
 .version-strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+.version-cell { flex: none; display: flex; flex-direction: column; gap: 4px; align-items: center; }
+.refine-btn { padding: 2px 8px; font-size: 11px; line-height: 1.4; }
 .version-item {
   flex: none; width: 82px; height: 82px; padding: 0; border-radius: 9px; overflow: hidden;
   border: 2px solid transparent; background: var(--bg-inset); position: relative; cursor: pointer;
 }
 .version-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.version-item.active { border-color: var(--accent); }
+.version-item.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.version-item:hover { border-color: var(--accent); }
 .version-tag {
   position: absolute; left: 3px; bottom: 3px; font-size: 10px; padding: 1px 4px;
   border-radius: 4px; background: rgba(0, 0, 0, 0.55); color: #fff;
+}
+.picked {
+  position: absolute; right: 3px; top: 3px; width: 17px; height: 17px; line-height: 17px;
+  text-align: center; border-radius: 50%; font-size: 11px; font-weight: 700;
+  background: var(--accent); color: var(--accent-contrast);
+}
+@media (max-width: 900px) {
+  .detail-grid { grid-template-columns: 1fr; }
 }
 img.full {
   width: 100%; border-radius: 10px; background: var(--bg-inset); display: block; margin: 8px 0 4px;

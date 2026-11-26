@@ -34,7 +34,7 @@ from loguru import logger
 
 from ..generation.asset_store import _find_entry, _resolve_entry_path
 from . import jobs as job_store
-from .contract import MediaError, MediaRequest, MediaResult
+from .contract import MediaError, MediaRef, MediaRequest, MediaResult
 from .providers.registry import build_image_provider
 from .settings import settings
 from .store import (
@@ -43,6 +43,7 @@ from .store import (
     image_dir_for,
     list_images,
     read_sidecar,
+    resolve_reference_image,
     save_image,
     select_image,
 )
@@ -87,14 +88,43 @@ def _cached_image(root: str | Path | None, novel: str, prompt_id: str, fingerpri
     return None
 
 
+def _reference_refs(
+    root: str | Path | None, prompt_id: str, reference_image_id: str
+) -> list[MediaRef]:
+    """已生成图 id → 图生图参考绑定。空 id 表示本次是纯文生图。
+
+    图必须是同条目旧版（store 校验）；`label` 记 image_id，回溯时看得出参考的是哪一版。
+    解析失败直接抛错——在 preview 阶段就挡下，不进确认码、更不发请求。
+    """
+    if not reference_image_id:
+        return []
+    path, record = resolve_reference_image(root, reference_image_id, prompt_id=prompt_id)
+    return [
+        MediaRef(
+            role="reference_image",
+            path=path,
+            label=f"{reference_image_id}:v{record.version}",
+        )
+    ]
+
+
 def preview(
-    root: str | Path | None, prompt_id: str, *, seed: int | None = None
+    root: str | Path | None,
+    prompt_id: str,
+    *,
+    seed: int | None = None,
+    reference_image_id: str = "",
 ) -> dict[str, Any]:
-    """算账不花钱：算指纹、给确认码、报能力缺口与额度。"""
+    """算账不花钱：算指纹、给确认码、报能力缺口与额度。
+
+    带 `reference_image_id` 时按图生图预检：参考图进指纹、进能力校验，
+    换一张参考图就是新确认码——和改正文/换模型是同一套闸门语义。
+    """
     novel, entry, markdown, _ = _prompt_context(root, prompt_id)
     body = extract_prompt_body(markdown)
     provider = build_image_provider()
     _, image_dir = image_dir_for(root, prompt_id)
+    refs = _reference_refs(root, prompt_id, reference_image_id)
 
     job = job_store.build_job(
         novel=novel,
@@ -109,7 +139,7 @@ def preview(
         size=settings.image_size,
         ratio=settings.image_ratio,
         seed=seed,
-        refs=[],
+        refs=refs,
         output_dir=str(image_dir),
     )
     previous = job_store.load_job(root, novel, job.job_id)
@@ -142,6 +172,16 @@ def preview(
         "ratio": job.ratio,
         "seed": job.seed,
         "n": request.n,
+        "reference_image_id": reference_image_id,
+        "reference_image": (
+            {
+                "id": reference_image_id,
+                "label": refs[0].label,
+                "path": str(refs[0].path),
+            }
+            if refs
+            else None
+        ),
         "state": job.state,
         "blocking": issues,
         "warnings": [item for item in [provider_watermark_warning()] if item],
@@ -152,6 +192,22 @@ def preview(
         "images": [item.model_dump(mode="json") for item in list_images(root, novel, prompt_id=prompt_id)],
         "prompt_stale": bool(cached and cached.fingerprint != job.fingerprint),
     }
+
+
+def _refs_from_job(job: Any) -> list[MediaRef]:
+    """从**预览记录**恢复参考图绑定，不信任提交阶段再传的参数。
+
+    确认码绑定的是预览时的指纹（含 refs）。若允许 generate 阶段改参考图，等于绕过了
+    确认闸门——所以这里的唯一真相是落盘的 job.refs：想换图必须重新 preview 拿新码。
+    """
+    return [
+        MediaRef(
+            role="reference_image",
+            path=Path(ref["path"]),
+            label=str(ref.get("label") or ""),
+        )
+        for ref in job.refs
+    ]
 
 
 def provider_watermark_warning() -> str:
@@ -187,7 +243,7 @@ def generate_stream(
         size=job.size,
         ratio=job.ratio,
         seed=job.seed,
-        refs=[],
+        refs=_refs_from_job(job),
         output_dir=str(image_dir),
     )
     job_store.check_confirmation(fresh, confirmation)

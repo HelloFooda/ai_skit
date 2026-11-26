@@ -482,6 +482,29 @@ export interface MediaPreview {
   images: MediaImageRecord[];
   /** 已有图不是按当前提示词出的 */
   prompt_stale: boolean;
+  /** 本次绑定的参考图（图生图时非空） */
+  reference_image_id?: string;
+  reference_image?: { id: string; label: string; path: string } | null;
+}
+
+export interface MediaRefineDraft {
+  prompt_id: string;
+  novel: string;
+  title: string;
+  addition: string;
+  before_body: string;
+  after_body: string;
+  /** 用户确认后原样 PUT 到 /api/assets/prompts/{id} 落盘 */
+  after_markdown: string;
+  /** unified diff 行：+ 新增 / - 删除 / 空格 上下文 */
+  diff: string[];
+  /** LLM 实际输出的补丁，供回溯 */
+  patches: Array<{ op: string; anchor: string; text: string }>;
+  base_hash: string;
+  after_hash: string;
+  usage: { input_tokens: number; output_tokens: number; total_tokens: number; llm_calls: number; llm_errors: number };
+  prompt_version: string;
+  warnings: string[];
 }
 
 export interface MediaImagesResponse {
@@ -511,11 +534,36 @@ export function mediaFileUrl(novel: string, path: string): string {
   return `/api/media/file?novel=${encodeURIComponent(novel)}&path=${encodeURIComponent(path)}`;
 }
 
-export function previewMedia(promptId: string, seed?: number | null): Promise<MediaPreview> {
+export function previewMedia(
+  promptId: string,
+  seed?: number | null,
+  referenceImageId = "",
+): Promise<MediaPreview> {
   return assetFetch("/api/media/preview", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt_id: promptId, seed: seed ?? null }),
+    body: JSON.stringify({
+      prompt_id: promptId,
+      seed: seed ?? null,
+      reference_image_id: referenceImageId,
+    }),
+  });
+}
+
+/** 追加描述 → LLM 补丁式融合草案：不落盘、不出图、不扣图费 */
+export function refineMedia(
+  promptId: string,
+  addition: string,
+  referenceImageId = "",
+): Promise<MediaRefineDraft> {
+  return assetFetch("/api/media/refine", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt_id: promptId,
+      addition,
+      reference_image_id: referenceImageId,
+    }),
   });
 }
 
