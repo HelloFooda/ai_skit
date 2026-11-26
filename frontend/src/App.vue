@@ -37,6 +37,11 @@ async function loadNovelOptions(initial = false) {
   }
 }
 
+function onNovelPick(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (value) novelTitle.value = value;
+}
+
 // 高级设置：默认全部走默认口径，用户不用管
 const showAdvanced = ref(false);
 const characterHint = ref("");
@@ -509,20 +514,24 @@ function goGenerate() {
         <div class="composer-box">
           <div class="title-row">
             <span class="title-label">小说名</span>
+            <select
+              class="novel-pick"
+              :value="novelOptions.some((n) => n.name === novelTitle) ? novelTitle : ''"
+              title="选择已归档小说"
+              @change="onNovelPick"
+            >
+              <option value="" disabled>
+                {{ novelOptions.length ? "选择已归档…" : "暂无归档" }}
+              </option>
+              <option v-for="n in novelOptions" :key="n.name" :value="n.name">
+                {{ n.title }} · {{ n.entries }} 项
+              </option>
+            </select>
             <input
               v-model="novelTitle"
               class="title-input"
-              list="novel-options"
-              placeholder="输入新小说名，或从已归档小说里选"
+              placeholder="输入新小说名，或从左侧选已归档"
             />
-            <datalist id="novel-options">
-              <option
-                v-for="n in novelOptions"
-                :key="n.name"
-                :value="n.name"
-                :label="`${n.title} · ${n.entries} 项资产`"
-              ></option>
-            </datalist>
             <span v-if="novelListNotice" class="muted small" :title="novelListNotice">候选加载失败</span>
             <span v-else-if="novelOptions.length" class="muted small">{{ novelOptions.length }} 本已归档</span>
           </div>
@@ -951,6 +960,19 @@ function goGenerate() {
   font-size: 11.5px;
   color: var(--fg-muted);
   flex: none;
+}
+.novel-pick {
+  flex: none;
+  max-width: 220px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-subtle);
+  color: var(--fg-secondary);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 3px 6px;
+  cursor: pointer;
 }
 .title-input {
   flex: 1;
